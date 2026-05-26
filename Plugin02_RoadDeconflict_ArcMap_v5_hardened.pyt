@@ -994,47 +994,47 @@ class RoadDeconflictTool(object):
         p0 = arcpy.Parameter(displayName=u"Roads (Polyline) - Barrier",
                              name="in_roads", datatype="GPFeatureLayer",
                              parameterType="Required", direction="Input")
-        p0.category = "Inputs"
+        p0.category = "01 Inputs"
 
         p1 = arcpy.Parameter(displayName=u"Clearance Distance (map units)",
                              name="clearance", datatype="GPDouble",
                              parameterType="Required", direction="Input")
-        p1.category = "Inputs"; p1.value = 6.0
+        p1.category = "01 Inputs"; p1.value = 6.0
 
         p2 = arcpy.Parameter(displayName=u"Point Layers to Move (optional)",
                              name="in_points", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
-        p2.category = "Inputs"
+        p2.category = "01 Inputs"
 
         p3 = arcpy.Parameter(displayName=u"Line Layers to Move (optional)",
                              name="in_lines", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
-        p3.category = "Inputs"
+        p3.category = "01 Inputs"
 
         p4 = arcpy.Parameter(displayName=u"Polygon Layers to Move (optional)",
                              name="in_polygons", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
-        p4.category = "Inputs"
+        p4.category = "01 Inputs"
 
         p7 = arcpy.Parameter(displayName=u"Processing AOI (Polygon) - optional",
                              name="aoi_poly", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input")
-        p7.category = "Inputs"
+        p7.category = "01 Inputs"
 
         p5 = arcpy.Parameter(displayName=u"Output Geodatabase",
                              name="out_gdb", datatype="DEWorkspace",
                              parameterType="Required", direction="Input")
-        p5.category = "Outputs"
+        p5.category = "03 Outputs"
 
         p6 = arcpy.Parameter(displayName=u"Output Name Suffix",
                              name="name_suffix", datatype="GPString",
                              parameterType="Optional", direction="Input")
-        p6.category = "Outputs"; p6.value = "_RDCL"
+        p6.category = "03 Outputs"; p6.value = "_RDCL"
 
         p8 = arcpy.Parameter(displayName=u"Line Strategy",
                              name="line_strategy", datatype="GPString",
                              parameterType="Optional", direction="Input")
-        p8.category = "Line Options"
+        p8.category = "02 Line Options"
         try:
             p8.filter.type = "ValueList"
             p8.filter.list = ["LOCAL_PUSH", "WHOLE_OFFSET"]
@@ -1045,7 +1045,7 @@ class RoadDeconflictTool(object):
         p9 = arcpy.Parameter(displayName=u"WHOLE_OFFSET Side (only if WHOLE_OFFSET)",
                              name="offset_side", datatype="GPString",
                              parameterType="Optional", direction="Input")
-        p9.category = "Line Options"
+        p9.category = "02 Line Options"
         try:
             p9.filter.type = "ValueList"
             p9.filter.list = ["AUTO", "LEFT", "RIGHT"]
@@ -1056,67 +1056,67 @@ class RoadDeconflictTool(object):
         p10 = arcpy.Parameter(displayName=u"Densify Step for Lines (map units; 0 = no densify)",
                               name="densify_step", datatype="GPDouble",
                               parameterType="Optional", direction="Input")
-        p10.category = "Line Options"; p10.value = 0.0
+        p10.category = "02 Line Options"; p10.value = 0.0
 
         p11 = arcpy.Parameter(displayName=u"Preserve Line Endpoints (recommended)",
                               name="preserve_endpoints", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p11.category = "Line Options"; p11.value = True
+        p11.category = "02 Line Options"; p11.value = True
 
         p12 = arcpy.Parameter(displayName=u"Smoothing Iterations (Chaikin; 0 = off)",
                               name="smooth_iters", datatype="GPLong",
                               parameterType="Optional", direction="Input")
-        p12.category = "Line Options"; p12.value = 0
+        p12.category = "02 Line Options"; p12.value = 0
 
         p15 = arcpy.Parameter(displayName=u"Max Deflection Delta at Line Vertices (degrees; 0 = off)",
                               name="max_deflection_deg", datatype="GPDouble",
                               parameterType="Optional", direction="Input")
-        p15.category = "Line Options"; p15.value = 25.0
+        p15.category = "02 Line Options"; p15.value = 25.0
 
         p13 = arcpy.Parameter(displayName=u"Max Shift (cap movement; 0 = no cap)",
                               name="max_shift", datatype="GPDouble",
                               parameterType="Optional", direction="Input")
-        p13.category = "Advanced"; p13.value = 0.0
+        p13.category = "05 Advanced"; p13.value = 0.0
 
         p14 = arcpy.Parameter(displayName=u"Max Iterations (line relaxation / polygon refinement)",
                               name="max_iter", datatype="GPLong",
                               parameterType="Optional", direction="Input")
-        p14.category = "Advanced"; p14.value = 8
+        p14.category = "05 Advanced"; p14.value = 8
 
         p16 = arcpy.Parameter(displayName=u"Use Near_analysis for Points/Polygons (faster on big data)",
                               name="use_near", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p16.category = "Advanced"; p16.value = True
+        p16.category = "05 Advanced"; p16.value = True
 
         p17 = arcpy.Parameter(displayName=u"Lock Field (optional; value 0 locks feature from moving)",
                               name="lock_field", datatype="GPString",
                               parameterType="Optional", direction="Input")
-        p17.category = "Advanced"
+        p17.category = "05 Advanced"
 
         p22 = arcpy.Parameter(displayName=u"Near Chunk Size (features per Near_analysis chunk)",
                               name="near_chunk_size", datatype="GPLong",
                               parameterType="Optional", direction="Input")
-        p22.category = "Advanced"; p22.value = 50000
+        p22.category = "05 Advanced"; p22.value = 50000
 
         p18 = arcpy.Parameter(displayName=u"Create Error Feature Classes",
                               name="create_errors", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p18.category = "QC / Reporting"; p18.value = True
+        p18.category = "04 QC / Reporting"; p18.value = True
 
         p19 = arcpy.Parameter(displayName=u"Create Displacement Vectors (visual QC)",
                               name="create_vectors", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p19.category = "QC / Reporting"; p19.value = False
+        p19.category = "04 QC / Reporting"; p19.value = False
 
         p20 = arcpy.Parameter(displayName=u"Write CSV Report (in output GDB folder)",
                               name="write_csv", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p20.category = "QC / Reporting"; p20.value = True
+        p20.category = "04 QC / Reporting"; p20.value = True
 
         p21 = arcpy.Parameter(displayName=u"Keep NEAR_* fields on outputs (debug)",
                               name="keep_near_fields", datatype="GPBoolean",
                               parameterType="Optional", direction="Input")
-        p21.category = "QC / Reporting"; p21.value = False; p21.enabled = False
+        p21.category = "04 QC / Reporting"; p21.value = False; p21.enabled = False
 
         return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9,
                 p10, p11, p12, p13, p14, p15, p16, p17, p18, p19,
