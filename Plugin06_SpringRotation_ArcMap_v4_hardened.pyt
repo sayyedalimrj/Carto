@@ -980,11 +980,11 @@ class SpringRotationFinalSuiteTool(object):
         p7 = arcpy.Parameter(displayName="Symbology template layer (optional; from current map)", name="sym_layer",
                              datatype="GPFeatureLayer", parameterType="Optional", direction="Input")
         _set_category(p7, CAT_SYM)
-        p8 = arcpy.Parameter(displayName="Auto-apply simple symbology (ArcMap only; if no template)", name="auto_symbology",
+        p8 = arcpy.Parameter(displayName="Auto-apply simple symbology (if no template)", name="auto_symbology",
                              datatype="GPBoolean", parameterType="Optional", direction="Input")
         p8.value = True
         _set_category(p8, CAT_SYM)
-        p9 = arcpy.Parameter(displayName="Symbol size (points; ArcMap auto-symbology)", name="symbol_size",
+        p9 = arcpy.Parameter(displayName="Symbol size (points; auto-symbology)", name="symbol_size",
                              datatype="GPDouble", parameterType="Optional", direction="Input")
         p9.value = 40.0
         _set_category(p9, CAT_SYM)
@@ -1019,7 +1019,7 @@ class SpringRotationFinalSuiteTool(object):
         p15.value = 5.0
         _set_category(p15, CAT_ADV)
 
-        p16 = arcpy.Parameter(displayName="AOI sketch", name="aoi_sketch",
+        p16 = arcpy.Parameter(displayName="AOI sketch (polygon)", name="aoi_sketch",
                               datatype="GPFeatureRecordSetLayer", parameterType="Optional", direction="Input")
         p16.value = _make_aoi_featureset_schema()
         _set_category(p16, CAT_AOI)
