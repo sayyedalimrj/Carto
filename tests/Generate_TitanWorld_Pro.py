@@ -743,46 +743,76 @@ def build_stage2_hydrology(gdb: str) -> None:
     seeds = seeds[:DRAINAGE_STREAMS]
     log(f"  Tracing {len(seeds)} streams from peak rings")
 
+    # File geodatabases forbid more than one open InsertCursor on the
+    # same workspace at any given time. We therefore buffer every row
+    # (shape + attributes) in plain Python lists during the trace loop,
+    # then flush each feature class sequentially with exactly one
+    # InsertCursor open at a time.
     did = riv_id = sea_id = abr_id = 0
     paths: List[List[Tuple[float, float]]] = []
-    drainage_cur = arcpy.da.InsertCursor(
-        drainage_fc, ["SHAPE@", "DrainID", "StreamType", "HeadElev_M"])
-    river_cur = arcpy.da.InsertCursor(
-        river_fc, ["SHAPE@", "RiverID", "Name", "HeadElev_M"])
-    season_cur = arcpy.da.InsertCursor(
-        season_fc, ["SHAPE@", "StreamID", "Name", "HeadElev_M"])
-    abreez_cur = arcpy.da.InsertCursor(
-        abreez_fc, ["SHAPE@", "AbreezID", "Name", "HeadElev_M"])
-    try:
-        for sx, sy in seeds:
-            path = _trace_stream(sx, sy)
-            if len(path) < 8:
-                continue
-            head_elev = get_elevation(path[0][0], path[0][1])
-            shape = make_polyline(path)
-            if head_elev > 1500.0:
-                stype = "RIVER"
-                river_cur.insertRow([
-                    shape, riv_id, f"River_{riv_id:03d}", head_elev,
-                ])
-                riv_id += 1
-            elif head_elev > 1200.0:
-                stype = "STREAM"
-                season_cur.insertRow([
-                    shape, sea_id, f"Seasonal_{sea_id:03d}", head_elev,
-                ])
-                sea_id += 1
-            else:
-                stype = "CREEK"
-                abreez_cur.insertRow([
-                    shape, abr_id, f"Abreez_{abr_id:03d}", head_elev,
-                ])
-                abr_id += 1
-            drainage_cur.insertRow([shape, did, stype, head_elev])
-            paths.append(path)
-            did += 1
-    finally:
-        del drainage_cur, river_cur, season_cur, abreez_cur
+
+    drainage_rows: List[Tuple[arcpy.Polyline, int, str, float]] = []
+    river_rows: List[Tuple[arcpy.Polyline, int, str, float]] = []
+    season_rows: List[Tuple[arcpy.Polyline, int, str, float]] = []
+    abreez_rows: List[Tuple[arcpy.Polyline, int, str, float]] = []
+
+    for sx, sy in seeds:
+        path = _trace_stream(sx, sy)
+        if len(path) < 8:
+            continue
+        head_elev = get_elevation(path[0][0], path[0][1])
+        shape = make_polyline(path)
+        if head_elev > 1500.0:
+            stype = "RIVER"
+            river_rows.append(
+                (shape, riv_id, f"River_{riv_id:03d}", head_elev))
+            riv_id += 1
+        elif head_elev > 1200.0:
+            stype = "STREAM"
+            season_rows.append(
+                (shape, sea_id, f"Seasonal_{sea_id:03d}", head_elev))
+            sea_id += 1
+        else:
+            stype = "CREEK"
+            abreez_rows.append(
+                (shape, abr_id, f"Abreez_{abr_id:03d}", head_elev))
+            abr_id += 1
+        drainage_rows.append((shape, did, stype, head_elev))
+        paths.append(path)
+        did += 1
+
+    # Flush each feature class with its own single-cursor block.
+    log(f"  Flushing {len(drainage_rows)} Drainage rows")
+    with arcpy.da.InsertCursor(
+            drainage_fc,
+            ["SHAPE@", "DrainID", "StreamType", "HeadElev_M"]) as cur:
+        for row in drainage_rows:
+            cur.insertRow(list(row))
+        del cur  # Force release of GDB edit lock
+
+    log(f"  Flushing {len(river_rows)} River_L rows")
+    with arcpy.da.InsertCursor(
+            river_fc,
+            ["SHAPE@", "RiverID", "Name", "HeadElev_M"]) as cur:
+        for row in river_rows:
+            cur.insertRow(list(row))
+        del cur  # Force release of GDB edit lock
+
+    log(f"  Flushing {len(season_rows)} Seasonal_River_L rows")
+    with arcpy.da.InsertCursor(
+            season_fc,
+            ["SHAPE@", "StreamID", "Name", "HeadElev_M"]) as cur:
+        for row in season_rows:
+            cur.insertRow(list(row))
+        del cur  # Force release of GDB edit lock
+
+    log(f"  Flushing {len(abreez_rows)} Abreez rows")
+    with arcpy.da.InsertCursor(
+            abreez_fc,
+            ["SHAPE@", "AbreezID", "Name", "HeadElev_M"]) as cur:
+        for row in abreez_rows:
+            cur.insertRow(list(row))
+        del cur  # Force release of GDB edit lock
 
     # ----- Canals: straight engineered channels along the plain edges ----
     # We emit one canal per primary axis offset from the plain center to
@@ -1365,50 +1395,67 @@ def build_stage3_roads(gdb: str) -> None:
 
     # ----- Bridge_P / Culvert_Pnt at every road x river intersection -----
     log("  Computing Bridge_P / Culvert_Pnt at named-road x river crossings")
+    # Buffer hits in memory so we never hold two InsertCursors open
+    # against the same File GDB workspace simultaneously.
+    bridge_rows: List[Tuple[arcpy.PointGeometry, int, str, int]] = []
+    culvert_rows: List[Tuple[arcpy.PointGeometry, int, str, int]] = []
+    for coords, rcls in crossings_for_layer:
+        for ri, river in enumerate(RIVER_PATHS):
+            if len(river) < 2:
+                continue
+            # Cheap bbox rejection.
+            rx_min = min(p[0] for p in river)
+            rx_max = max(p[0] for p in river)
+            ry_min = min(p[1] for p in river)
+            ry_max = max(p[1] for p in river)
+            cx_min = min(p[0] for p in coords)
+            cx_max = max(p[0] for p in coords)
+            cy_min = min(p[1] for p in coords)
+            cy_max = max(p[1] for p in coords)
+            if (cx_max < rx_min or cx_min > rx_max or
+                    cy_max < ry_min or cy_min > ry_max):
+                continue
+            first_hit = None
+            for i in range(len(coords) - 1):
+                if first_hit is not None:
+                    break
+                for j in range(len(river) - 1):
+                    hit = _segment_intersection(
+                        coords[i], coords[i + 1],
+                        river[j], river[j + 1])
+                    if hit is None:
+                        continue
+                    first_hit = hit
+                    break
+            if first_hit is None:
+                continue
+            ix, iy, _t, _u = first_hit
+            # Major roads -> Bridge_P, minor roads -> Culvert_Pnt.
+            if rcls in ("FREEWAY", "HIGHWAY", "PARKWAY"):
+                bridge_rows.append(
+                    (make_point(ix, iy), bid, rcls, ri))
+                bid += 1
+            else:
+                culvert_rows.append(
+                    (make_point(ix, iy), cid, rcls, ri))
+                cid += 1
+
+    # Flush Bridge_P and Culvert_Pnt sequentially -- one cursor at a time.
+    log(f"  Flushing {len(bridge_rows)} Bridge_P rows")
     with arcpy.da.InsertCursor(
-            bridge_fc, ["SHAPE@", "BridgeID", "RoadClass", "RiverIdx"]) as bp, \
-         arcpy.da.InsertCursor(
+            bridge_fc,
+            ["SHAPE@", "BridgeID", "RoadClass", "RiverIdx"]) as bp:
+        for row in bridge_rows:
+            bp.insertRow(list(row))
+        del bp  # Force release of GDB edit lock
+
+    log(f"  Flushing {len(culvert_rows)} Culvert_Pnt rows")
+    with arcpy.da.InsertCursor(
             culvert_fc,
             ["SHAPE@", "CulvertID", "RoadClass", "RiverIdx"]) as cp:
-        for coords, rcls in crossings_for_layer:
-            for ri, river in enumerate(RIVER_PATHS):
-                if len(river) < 2:
-                    continue
-                # Cheap bbox rejection.
-                rx_min = min(p[0] for p in river)
-                rx_max = max(p[0] for p in river)
-                ry_min = min(p[1] for p in river)
-                ry_max = max(p[1] for p in river)
-                cx_min = min(p[0] for p in coords)
-                cx_max = max(p[0] for p in coords)
-                cy_min = min(p[1] for p in coords)
-                cy_max = max(p[1] for p in coords)
-                if (cx_max < rx_min or cx_min > rx_max or
-                        cy_max < ry_min or cy_min > ry_max):
-                    continue
-                first_hit = None
-                for i in range(len(coords) - 1):
-                    if first_hit is not None:
-                        break
-                    for j in range(len(river) - 1):
-                        hit = _segment_intersection(
-                            coords[i], coords[i + 1],
-                            river[j], river[j + 1])
-                        if hit is None:
-                            continue
-                        first_hit = hit
-                        break
-                if first_hit is None:
-                    continue
-                ix, iy, _t, _u = first_hit
-                # Major roads -> Bridge_P, minor roads -> Culvert_Pnt.
-                if rcls in ("FREEWAY", "HIGHWAY", "PARKWAY"):
-                    bp.insertRow([make_point(ix, iy), bid, rcls, ri])
-                    bid += 1
-                else:
-                    cp.insertRow([make_point(ix, iy), cid, rcls, ri])
-                    cid += 1
-        del bp, cp  # Force release of GDB edit locks
+        for row in culvert_rows:
+            cp.insertRow(list(row))
+        del cp  # Force release of GDB edit lock
 
     log(f"  Inserted Bridge_P={bid}, Culvert_Pnt={cid} at river crossings")
 
