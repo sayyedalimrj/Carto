@@ -45,8 +45,31 @@ Hardened in v6 (vs v5 ULTIMATE):
   * Py2.7 hygiene: from __future__ import division, unicode-safe
     helpers, parallelProcessingFactor=100% for GP tools.
 
+Hardened in v6.1 (MASTER RULES revision):
+  * GP ENVIRONMENT snapshot at execute() entry: arcpy.env.extent,
+    mask, outputCoordinateSystem, workspace, scratchWorkspace,
+    overwriteOutput are saved, neutralized, and restored in finally.
+  * IN_MEMORY HYGIENE: arcpy.management.Delete("in_memory") flush
+    in finally + final gc.collect().
+  * TICK SAFETY CAP: new parameter `max_ticks_per_axis` (default
+    5000). Before the SMART_FEATURE engine starts inserting ticks for
+    a sheet, it computes the expected per-axis tick count
+    (ceil((xmax-xmin)/spacing) + 1) for both X and Y. If either
+    exceeds the cap the page is aborted with a loud warning, scratch
+    cursors are released, and the per-sheet try/except in execute()
+    moves on to the next layout. This prevents runaway loops on
+    extents that the user accidentally paired with a tiny spacing.
+  * SMART ENGINE GCS WARNING: at execute() entry (and again per MXD
+    inside _build_ticks_and_labels_for_extent), if the working CRS
+    is Geographic the SMART_FEATURE engine logs a loud warning that
+    it expects projected coordinates. The existing hard guard inside
+    the engine still raises ExecuteError so a Geographic CRS cannot
+    silently produce nonsense ticks, but the user now gets a clear
+    diagnostic before the raise.
+  * Narrow exceptions tightened around new GP calls.
+
 Author: Ali Mirjafari + Kiro
-Version: 6.0 (ArcMap / Python 2.7)
+Version: 6.1 (ArcMap / Python 2.7) - Master Rules
 """
 
 from __future__ import division
@@ -207,6 +230,59 @@ def _require_cartography_level():
     if (lvl or "").lower() in ("basic", "arcview"):
         _raise(u"Cartography tool requires Standard/Advanced license. "
                u"Current product level: {0}".format(lvl))
+
+
+# =============================================================================
+# 0b. GP environment snapshot / restore + in_memory flush  (MASTER RULES)
+# =============================================================================
+
+def _snapshot_gp_env():
+    """Capture critical arcpy.env values at execute() entry, then neutralize.
+    MASTER RULE 4."""
+    snap = {
+        "extent":                 arcpy.env.extent,
+        "mask":                   arcpy.env.mask,
+        "outputCoordinateSystem": arcpy.env.outputCoordinateSystem,
+        "workspace":              arcpy.env.workspace,
+        "scratchWorkspace":       arcpy.env.scratchWorkspace,
+        "overwriteOutput":        arcpy.env.overwriteOutput,
+    }
+    arcpy.env.extent = None
+    arcpy.env.mask = None
+    arcpy.env.outputCoordinateSystem = None
+    return snap
+
+def _restore_gp_env(snap):
+    if not snap:
+        return
+    for key in ("extent", "mask", "outputCoordinateSystem",
+                "workspace", "scratchWorkspace"):
+        try:
+            setattr(arcpy.env, key, snap.get(key))
+        except (RuntimeError, arcpy.ExecuteError, AttributeError):
+            pass
+    try:
+        arcpy.env.overwriteOutput = snap.get("overwriteOutput", True)
+    except (RuntimeError, arcpy.ExecuteError, AttributeError):
+        pass
+
+def _flush_in_memory():
+    """Final scratch flush. MASTER RULE 6."""
+    try:
+        arcpy.management.Delete("in_memory")
+    except (arcpy.ExecuteError, RuntimeError):
+        pass
+
+
+class TickCapExceeded(arcpy.ExecuteError):
+    """
+    Raised by the SMART_FEATURE engine when the expected tick count for
+    either axis exceeds the user-configurable safety cap
+    (max_ticks_per_axis). Caught by the per-sheet try/except in execute()
+    so the offending page is skipped and the batch continues with the
+    next layout instead of running for hours and OOM-crashing ArcMap.
+    """
+    pass
 
 
 # =============================================================================
@@ -622,6 +698,7 @@ def _build_ticks_and_labels_for_extent(
         respect_df_rotation=True,
         allow_geo_approx=False,
         max_ticks=20000,
+        max_ticks_per_axis=5000,
         continue_on_error=False,
         log_file=None,
         dry_run=False,
@@ -636,7 +713,18 @@ def _build_ticks_and_labels_for_extent(
     scale_denom = _safe_float(scale_denom, 0.0)
     if scale_denom <= 0:
         _raise(u"Reference scale denominator must be > 0 (e.g., 25000).")
+
+    # MASTER RULE: SMART engine GCS warning. The hard guard below still
+    # raises (a Geographic CRS would produce nonsense projected ticks)
+    # but we log a clearly visible warning first so the diagnostic is
+    # not buried under the traceback.
     if getattr(sr, "type", None) == "Geographic":
+        _add_warn(
+            u"SMART_FEATURE engine sheet={0}: data frame is using a "
+            u"GEOGRAPHIC coordinate system. The SMART engine expects "
+            u"PROJECTED coordinates (e.g., UTM). Re-project the data "
+            u"frame before running, or switch to ESRI_XML.".format(
+                sheet_key))
         _raise(u"SMART_FEATURE engine requires Projected CRS for the data frame.")
 
     rot = 0.0
@@ -672,6 +760,50 @@ def _build_ticks_and_labels_for_extent(
 
     xmin, ymin = edges["XMIN"], edges["YMIN"]
     xmax, ymax = edges["XMAX"], edges["YMAX"]
+
+    # MASTER RULE: tick safety cap. Compute the expected per-axis tick
+    # count BEFORE we start inserting anything. If either axis exceeds
+    # max_ticks_per_axis, abort this page with a clearly logged warning
+    # so the per-sheet try/except in execute() can move on to the next
+    # layout. Without this check a tiny spacing on a continental extent
+    # would silently kick off ~10^7 InsertCursor calls and either OOM
+    # the 32-bit ArcMap process or render unusable output.
+    cap = _safe_int(max_ticks_per_axis, 5000)
+    if cap < 1:
+        cap = 5000
+    width = float(xmax) - float(xmin)
+    height = float(ymax) - float(ymin)
+    if width <= 0 or height <= 0:
+        _add_warn(
+            u"Sheet {0}: degenerate extent (W={1:.6f} H={2:.6f}). "
+            u"Skipping page.".format(sheet_key, width, height))
+        _lock_write_line(
+            log_file,
+            u"[{0}] SKIP sheet={1} reason=degenerate_extent W={2} H={3}".format(
+                _now_str(), sheet_key, width, height))
+        raise TickCapExceeded(
+            u"Sheet {0}: degenerate extent.".format(sheet_key))
+
+    n_x_expected = int(math.ceil(width  / float(spacing_proj))) + 1
+    n_y_expected = int(math.ceil(height / float(spacing_proj))) + 1
+    _diag(u"sheet={0} expected ticks: X={1} Y={2} cap={3}".format(
+        sheet_key, n_x_expected, n_y_expected, cap))
+    if n_x_expected > cap or n_y_expected > cap:
+        msg = (u"Sheet {0}: expected tick count exceeds safety cap "
+               u"(X={1}, Y={2}, cap={3}). The combination of extent "
+               u"({4:.3f} x {5:.3f}) and projected spacing ({6:.3f}) "
+               u"would produce a runaway tick set. Aborting this page "
+               u"and continuing with the next layout. Increase the "
+               u"projected spacing, shrink the AOI, or raise the "
+               u"'Max ticks per axis' parameter to override.").format(
+            sheet_key, n_x_expected, n_y_expected, cap,
+            width, height, float(spacing_proj))
+        _add_warn(msg)
+        _lock_write_line(
+            log_file,
+            u"[{0}] SKIP sheet={1} reason=tick_cap X={2} Y={3} cap={4}".format(
+                _now_str(), sheet_key, n_x_expected, n_y_expected, cap))
+        raise TickCapExceeded(msg)
 
     xs = _compute_values(xmin, xmax, spacing_proj, max_count=max_ticks)
     ys = _compute_values(ymin, ymax, spacing_proj, max_count=max_ticks)
@@ -1271,6 +1403,7 @@ class BatchGridBuilder07(object):
     IDX_OUT_IMG_FOLDER    = 45
     IDX_IMG_DPI           = 46
     IDX_LOG_FILE          = 47
+    IDX_MAX_TICKS_PER_AXIS = 48
 
     def __init__(self):
         self.label = u"07) Batch Grid Builder (ArcMap 2.7) - v6 hardened"
@@ -1706,6 +1839,22 @@ class BatchGridBuilder07(object):
     direction='Input')
         p.append(p_log)
 
+        # MASTER RULE: per-axis tick safety cap (idx 48).
+        p_mtpa = arcpy.Parameter(
+            displayName='(SMART_FEATURE) Max ticks PER AXIS (safety cap)',
+            name='max_ticks_per_axis',
+            datatype='GPLong',
+            parameterType='Optional',
+            direction='Input')
+        p_mtpa.value = 5000
+        p_mtpa.description = (
+            "Maximum number of ticks expected on a single axis (X or Y) "
+            "for one sheet. If the extent / projected spacing combination "
+            "would exceed this count, the SMART_FEATURE engine aborts that "
+            "page with a warning and moves on to the next layout. Default "
+            "5000.")
+        p.append(p_mtpa)
+
         return p
 
     # ---------- updateParameters (now correctly inside the class) ----------
@@ -1787,11 +1936,26 @@ class BatchGridBuilder07(object):
 
     # ---------- execute (now correctly inside the class) ----------
     def execute(self, parameters, messages):
+        # MASTER RULE 4: snapshot env at entry, neutralize, restore in finally.
+        env_snap = _snapshot_gp_env()
         arcpy.env.overwriteOutput = True
         try:
             arcpy.env.parallelProcessingFactor = "100%"
         except Exception:
             pass
+
+        try:
+            self._execute_inner(parameters, messages)
+        finally:
+            # MASTER RULE 6: in_memory flush + env restore + gc on every exit.
+            _flush_in_memory()
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            _restore_gp_env(env_snap)
+
+    def _execute_inner(self, parameters, messages):
 
         # Read parameters via named indices (no more drift)
         mode             = parameters[self.IDX_MODE].valueAsText
@@ -1829,6 +1993,8 @@ class BatchGridBuilder07(object):
 
         continue_on_err  = bool(parameters[self.IDX_CONTINUE_ON_ERR].value)
         max_ticks        = _safe_int(parameters[self.IDX_MAX_TICKS].value, 20000)
+        max_ticks_per_axis = _safe_int(
+            parameters[self.IDX_MAX_TICKS_PER_AXIS].value, 5000)
         cleanup_sheet    = bool(parameters[self.IDX_CLEANUP_SHEET].value)
         dry_run          = bool(parameters[self.IDX_DRY_RUN].value)
         symbology_lyr    = parameters[self.IDX_SYMBOLOGY_LYR].valueAsText
@@ -1922,6 +2088,23 @@ class BatchGridBuilder07(object):
                 if engine == "ESRI_XML" and getattr(sr, "type", None) == "Geographic":
                     _raise(u"ESRI_XML engine requires a projected CRS for the data frame.")
 
+                # MASTER RULE: SMART engine GCS warning, raised once per MXD
+                # before we even loop over sheets so the user sees the
+                # diagnostic at the top of the run.
+                if engine == "SMART_FEATURE" and getattr(sr, "type", None) == "Geographic":
+                    _add_warn(
+                        u"SMART_FEATURE engine: data frame uses a GEOGRAPHIC "
+                        u"coordinate system. The SMART engine expects "
+                        u"PROJECTED coordinates (e.g., UTM). Project the "
+                        u"data frame before running, or switch to ESRI_XML. "
+                        u"All sheets in this MXD will fail with "
+                        u"PROJECTED_CRS_REQUIRED.")
+                    _lock_write_line(
+                        log_file,
+                        u"[{0}] WARN mxd={1} reason=geographic_crs_for_smart".format(
+                            _now_str(),
+                            (mxd_path if mxd_path else u"CURRENT")))
+
                 if engine == "SMART_FEATURE":
                     fds = _ensure_feature_dataset(gdb, fds_name, sr)
                 else:
@@ -1999,6 +2182,7 @@ class BatchGridBuilder07(object):
                                 corner_extra_mm=corner_extra_mm,
                                 respect_df_rotation=respect_rot,
                                 max_ticks=max_ticks,
+                                max_ticks_per_axis=max_ticks_per_axis,
                                 continue_on_error=continue_on_err,
                                 log_file=log_file,
                                 dry_run=dry_run,
