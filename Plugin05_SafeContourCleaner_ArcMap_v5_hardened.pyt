@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Plugin 05 - Safe Contour Cleaner (ArcMap / Python 2.7)  v5 HARDENED
-====================================================================
+Plugin 05 - Safe Contour Cleaner (ArcMap / Python 2.7)  v5 HARDENED (MASTER RULES)
+==================================================================================
 Toolbox containing TWO tools:
 
   Tool 1: AOI Brush Builder
@@ -13,44 +13,33 @@ Toolbox containing TWO tools:
     Build a cleaned COPY of contour line layers for cartographic
     output, leaving the originals untouched. Removes dense /
     overlapping contour segments inside an AOI while protecting a
-    safety band inside the frame border (so contours never get
-    deleted right at the neatline). Supports segment erase or
-    whole-feature delete, an optional min-segment-length cleanup,
-    review/QA outputs, and a CSV report.
+    safety band inside the frame border.
 
-Hardened in v5 (vs v3 ULTIMATE):
-  * SELECTION-BYPASS HARDWIRED. Every input layer (contours, frame,
-    AOI, masks, brushes) is resolved to its on-disk catalogPath.
-    Active selections are warned about and ignored - the tool always
-    operates on the FULL dataset.
-  * MEMORY DISCIPLINE. All intermediates live in scratchGDB on disk
-    via arcpy.CreateUniqueName(..., scratchGDB). The big ones
-    (merged contours, AOI clip, dissolved frame, frame buffer band,
-    eligible/non-eligible split, dense mask, near table, eligible
-    clean, removed segments, review intersect) all stage on disk.
-  * NEAR TABLE in OID-bounded chunks for huge eligible sets so
-    GenerateNearTable cannot blow 32-bit RAM. Default chunk = 50000
-    features.
-  * Spatial-indexed eligible FC for the dense-mask pass.
-  * NARROW EXCEPTIONS. Every "except:" is "except Exception:". v3
-    had ~25 bare excepts; both v5 builds are now 0.
-  * STAGE-BY-STAGE [DIAG] LOGGING. Per layer:
-    inputs total -> in AOI -> eligible / protected -> dense ->
-    final mask after frame safety -> removed -> kept.
-  * Mask preserved as feature class; review layer = mask polygons
-    falling INSIDE the safe zone (the protected band) so a human
-    can decide whether to widen the safe margin.
-  * Editor session is no longer needed (all work is on disk
-    feature-classes, not in_memory).
-  * Dry-run mode produces preview outputs so QA can be done before
-    writing the cleaned contour FC.
-  * Approximate removed length is now computed and written into the
-    CSV report.
-  * Py2.7 hygiene: from __future__ import division, unicode-safe
-    helpers, parallelProcessingFactor=100%.
+Hardened in v5 (MASTER RULES revision):
+  * EXCEPTION HANDLING: narrow except blocks at GP calls
+    (arcpy.ExecuteError, RuntimeError). MemoryError / OSError
+    propagate and crash loudly.
+  * RAM MANAGEMENT: no big geometry caches in dicts; cursors stream.
+  * SELECTION HYGIENE: _resolve_full_source preserved, ignore_selection
+    is the default behavior.
+  * GP ENVIRONMENT: arcpy.env.extent / mask / outputCoordinateSystem /
+    workspace / scratchWorkspace snapshotted at execute() entry, set
+    to None, restored in finally.
+  * IN_MEMORY HYGIENE: every intermediate gets explicit
+    arcpy.Delete_management in finally; final
+    arcpy.Delete_management("in_memory") flush at end of execute().
+  * SINGLE-CLIP STRATEGY: AOI is dissolved into one multipart polygon
+    and a SINGLE arcpy.analysis.Clip is run on the whole dataset
+    (no per-feature Clip loop).
+  * AOI OPTIONALITY: parameter `allow_full_map_processing` (default
+    False). If AOI is empty and this is False -> error. If True ->
+    fall back to active map's extent and process the full map with
+    a loud warning.
+  * SLIVER REMOVAL: after clip, remove polygons/segments smaller than
+    the dataset XYTolerance.
 
 Author: Ali Mirjafari + Kiro
-Version: 5.0 (ArcMap / Python 2.7)
+Version: 5.1 (ArcMap / Python 2.7) - Master Rules
 """
 
 from __future__ import division
@@ -69,44 +58,49 @@ import gc
 
 def _to_unicode(v):
     """Best-effort unicode for ArcMap (Py2.7) without crashing."""
+    if v is None:
+        return u""
     try:
-        if v is None:
-            return u""
         if isinstance(v, unicode):  # noqa: F821 (Py2)
             return v
+    except NameError:
+        # Py3 fallback (should not occur in ArcMap, but harmless)
+        if isinstance(v, str):
+            return v
+    try:
+        return unicode(v, "utf-8")  # noqa: F821
+    except (UnicodeDecodeError, TypeError):
         try:
-            return unicode(v, "utf-8")  # noqa: F821
-        except Exception:
+            return unicode(v, "cp1256")  # noqa: F821
+        except (UnicodeDecodeError, TypeError):
             try:
-                return unicode(v, "cp1256")  # noqa: F821
-            except Exception:
                 return unicode(str(v), "utf-8", "ignore")  # noqa: F821
-    except Exception:
-        return u""
+            except (UnicodeDecodeError, TypeError):
+                return u""
 
 def _ascii_safe(u):
     uu = _to_unicode(u)
     try:
         return uu.encode("ascii", "replace")
-    except Exception:
+    except (UnicodeEncodeError, UnicodeDecodeError):
         return "?"
 
 def _msg(s):
     try:
         arcpy.AddMessage(_ascii_safe(s))
-    except Exception:
+    except (RuntimeError, arcpy.ExecuteError):
         pass
 
 def _warn(s):
     try:
         arcpy.AddWarning(_ascii_safe(s))
-    except Exception:
+    except (RuntimeError, arcpy.ExecuteError):
         pass
 
 def _err(s):
     try:
         arcpy.AddError(_ascii_safe(s))
-    except Exception:
+    except (RuntimeError, arcpy.ExecuteError):
         pass
 
 def _diag(s):
@@ -125,8 +119,8 @@ def _as_bool(v, default=False):
         return v
     try:
         s = _to_unicode(v).strip().lower()
-    except Exception:
-        s = ""
+    except (UnicodeError, TypeError):
+        s = u""
     if s in (u"true", u"1", u"yes", u"y", u"t", u"on"):
         return True
     if s in (u"false", u"0", u"no", u"n", u"f", u"off"):
@@ -137,29 +131,84 @@ def _unique(prefix="tmp"):
     return "{0}_{1}".format(prefix, uuid.uuid4().hex[:10])
 
 # =============================================================================
-# 1. Selection-bypass: resolve any layer to its on-disk source
+# 1. GP environment snapshot / restore (MASTER RULE 4)
+# =============================================================================
+
+def _snapshot_gp_env():
+    """Capture critical arcpy.env values at execute() entry."""
+    snap = {
+        "extent":                 arcpy.env.extent,
+        "mask":                   arcpy.env.mask,
+        "outputCoordinateSystem": arcpy.env.outputCoordinateSystem,
+        "workspace":              arcpy.env.workspace,
+        "scratchWorkspace":       arcpy.env.scratchWorkspace,
+        "overwriteOutput":        arcpy.env.overwriteOutput,
+    }
+    # Neutralize for clean GP execution
+    arcpy.env.extent = None
+    arcpy.env.mask = None
+    arcpy.env.outputCoordinateSystem = None
+    # workspace / scratchWorkspace intentionally left as-is here; tools below
+    # use scratchGDB explicitly. We snapshot them so they can be restored if a
+    # downstream call mutated them.
+    return snap
+
+def _restore_gp_env(snap):
+    if not snap:
+        return
+    try:
+        arcpy.env.extent = snap.get("extent")
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+    try:
+        arcpy.env.mask = snap.get("mask")
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+    try:
+        arcpy.env.outputCoordinateSystem = snap.get("outputCoordinateSystem")
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+    try:
+        arcpy.env.workspace = snap.get("workspace")
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+    try:
+        arcpy.env.scratchWorkspace = snap.get("scratchWorkspace")
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+    try:
+        arcpy.env.overwriteOutput = snap.get("overwriteOutput", True)
+    except (RuntimeError, arcpy.ExecuteError):
+        pass
+
+# =============================================================================
+# 2. Selection-bypass: resolve any layer to its on-disk source
 # =============================================================================
 
 def _selection_info(layer_or_path):
     """Return (selected_count, total_count, name)."""
     try:
         d = arcpy.Describe(layer_or_path)
-    except Exception:
+    except (RuntimeError, IOError, arcpy.ExecuteError):
         return (None, None, _to_unicode(layer_or_path))
     name = getattr(d, "name", _to_unicode(layer_or_path))
     fidset = getattr(d, "FIDSet", "") or ""
     total = None
     try:
         total = int(arcpy.GetCount_management(layer_or_path).getOutput(0))
-    except Exception:
+    except (RuntimeError, arcpy.ExecuteError, ValueError):
         total = None
     if fidset.strip() == "":
         return (0, total, name)
     sel_count = len([t for t in fidset.split(";") if t.strip() != ""])
     return (sel_count, total, name)
 
-def _resolve_full_source(layer_or_path):
-    """Return on-disk catalogPath for a layer; pass-through if already a path."""
+def _resolve_full_source(layer_or_path, ignore_selection=True):
+    """
+    Return on-disk catalogPath for a layer; pass-through if already a path.
+    Selection on the source layer is IGNORED by default - the returned path is
+    the full dataset.
+    """
     if not layer_or_path:
         return layer_or_path
     try:
@@ -167,7 +216,7 @@ def _resolve_full_source(layer_or_path):
         cp = getattr(d, "catalogPath", None)
         if cp:
             return cp
-    except Exception:
+    except (RuntimeError, IOError, arcpy.ExecuteError):
         pass
     return layer_or_path
 
@@ -175,19 +224,21 @@ def _announce_selection(label, layer_or_path):
     sel, total, name = _selection_info(layer_or_path)
     if sel and sel > 0:
         _warn(u"{lbl}: '{n}' has an active selection ({s} of {t}). Ignoring selection - processing FULL dataset.".format(
-            lbl=label, n=name, s=sel, t=(total if total is not None else u"?")))
+            lbl=label, n=name, s=sel,
+            t=(total if total is not None else u"?")))
     else:
         _diag(u"{lbl}: '{n}' total={t}, no active selection.".format(
-            lbl=label, n=name, t=(total if total is not None else u"?")))
+            lbl=label, n=name,
+            t=(total if total is not None else u"?")))
 
 # =============================================================================
-# 2. Path / workspace helpers
+# 3. Path / workspace helpers
 # =============================================================================
 
 def _get_count(fc):
     try:
         return int(arcpy.management.GetCount(fc).getOutput(0))
-    except Exception:
+    except (RuntimeError, arcpy.ExecuteError, ValueError):
         return 0
 
 def _scratch_unique(prefix):
@@ -206,10 +257,13 @@ def _normalize_output_path(out_ws, name):
     return os.path.join(out_ws, name)
 
 def _safe_delete(path):
+    """Best-effort delete; narrow exception handling."""
+    if not path:
+        return
     try:
-        if path and arcpy.Exists(path):
+        if arcpy.Exists(path):
             arcpy.management.Delete(path)
-    except Exception:
+    except (arcpy.ExecuteError, RuntimeError):
         pass
 
 def _ensure_scratch():
@@ -221,8 +275,15 @@ def _ensure_scratch():
             u"No scratch GDB available. Set arcpy.env.scratchGDB.")
     return sgdb
 
+def _flush_in_memory():
+    """Final scratch flush. MASTER RULE 6."""
+    try:
+        arcpy.management.Delete("in_memory")
+    except (arcpy.ExecuteError, RuntimeError):
+        pass
+
 # =============================================================================
-# 3. ArcMap dataframe helpers (mm -> map units)
+# 4. ArcMap dataframe helpers (mm -> map units, extent fallback, add layers)
 # =============================================================================
 
 def _get_df_scale():
@@ -233,9 +294,30 @@ def _get_df_scale():
         df = mxd.activeDataFrame
         if df and df.scale:
             return float(df.scale)
-    except Exception:
+    except (RuntimeError, AttributeError, arcpy.ExecuteError):
         return None
     return None
+
+def _get_df_extent_polygon(out_fc, sr):
+    """Return on-disk polygon FC matching the active DataFrame extent."""
+    import arcpy.mapping as mapping
+    mxd = mapping.MapDocument("CURRENT")
+    df = mxd.activeDataFrame
+    ext = df.extent
+    arcpy.management.CreateFeatureclass(
+        os.path.dirname(out_fc), os.path.basename(out_fc),
+        "POLYGON", spatial_reference=sr)
+    arr = arcpy.Array([
+        arcpy.Point(ext.XMin, ext.YMin),
+        arcpy.Point(ext.XMax, ext.YMin),
+        arcpy.Point(ext.XMax, ext.YMax),
+        arcpy.Point(ext.XMin, ext.YMax),
+        arcpy.Point(ext.XMin, ext.YMin),
+    ])
+    poly = arcpy.Polygon(arr, sr)
+    with arcpy.da.InsertCursor(out_fc, ["SHAPE@"]) as ic:
+        ic.insertRow([poly])
+    return out_fc
 
 def _mm_to_mapunits(mm, scale, mapunit_name):
     if mm is None or mm <= 0:
@@ -261,18 +343,32 @@ def _add_layers_to_map(layer_paths):
             if p and arcpy.Exists(p):
                 try:
                     mapping.AddLayer(df, mapping.Layer(p), "TOP")
-                except Exception:
+                except (RuntimeError, arcpy.ExecuteError):
                     _warn(u"Could not add layer to map: {0}".format(p))
         try:
             arcpy.RefreshActiveView()
             arcpy.RefreshTOC()
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             pass
-    except Exception:
+    except (RuntimeError, AttributeError, arcpy.ExecuteError):
         _warn(u"Run inside ArcMap to enable 'Add to map'.")
 
+def _get_xy_tolerance(fc, fallback=0.001):
+    """Return XYTolerance for the dataset's spatial reference."""
+    try:
+        sr = arcpy.Describe(fc).spatialReference
+        if sr is not None:
+            tol = getattr(sr, "XYTolerance", None)
+            if tol and float(tol) > 0:
+                return float(tol)
+    except (RuntimeError, AttributeError, arcpy.ExecuteError):
+        pass
+    return float(fallback)
+
+
+
 # =============================================================================
-# 4. Toolbox + Tool 1 (AOI Brush Builder)
+# 5. Toolbox + Tool 1 (AOI Brush Builder)
 # =============================================================================
 
 class Toolbox(object):
@@ -288,8 +384,9 @@ class AOIBrushBuilder(object):
         self.description = (
             u"Build an AOI polygon from polyline/polygon brush strokes "
             u"using buffer + union/erase. Optionally clip to a frame.\n\n"
-            u"v5: selection-bypass hardwired, scratchGDB-resident "
-            u"intermediates, narrow exceptions, [DIAG] logging."
+            u"v5 master-rules: selection-bypass hardwired, scratchGDB-resident "
+            u"intermediates, narrow exceptions, in_memory hygiene, env "
+            u"snapshot/restore."
         )
         self.canRunInBackground = True
 
@@ -389,7 +486,7 @@ class AOIBrushBuilder(object):
                 "Replace existing AOI (overwrite with brush)",
             )
             parameters[4].enabled = bool(need_existing)
-        except Exception:
+        except (RuntimeError, AttributeError, arcpy.ExecuteError):
             pass
 
     def updateMessages(self, parameters):
@@ -404,27 +501,32 @@ class AOIBrushBuilder(object):
                 parameters[4].setWarningMessage(
                     u"Operation requires an Existing AOI polygon. Provide it "
                     u"or switch to 'Create new AOI'.")
-        except Exception:
+        except (RuntimeError, AttributeError, arcpy.ExecuteError):
             pass
 
     def execute(self, parameters, messages):
+        # MASTER RULE 4: snapshot env, neutralize, restore in finally.
+        env_snap = _snapshot_gp_env()
         arcpy.env.overwriteOutput = True
         try:
             arcpy.env.parallelProcessingFactor = "100%"
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             pass
 
+        # Track intermediates so finally can clean them up. MASTER RULE 6.
+        intermediates = []
+
         try:
-            brush_fc_layer = parameters[0].valueAsText
-            brush_radius_mu = float(parameters[1].value or 0.0)
-            brush_radius_mm = float(parameters[2].value or 0.0)
-            operation = parameters[3].valueAsText
-            existing_aoi_layer = parameters[4].valueAsText
-            frame_fc_layer = parameters[5].valueAsText
-            clip_to_frame = _as_bool(parameters[6].value, True)
-            out_ws = parameters[7].valueAsText or arcpy.env.scratchGDB
-            out_name = parameters[8].valueAsText
-            add_to_map = _as_bool(parameters[9].value, True)
+            brush_fc_layer       = parameters[0].valueAsText
+            brush_radius_mu      = float(parameters[1].value or 0.0)
+            brush_radius_mm      = float(parameters[2].value or 0.0)
+            operation            = parameters[3].valueAsText
+            existing_aoi_layer   = parameters[4].valueAsText
+            frame_fc_layer       = parameters[5].valueAsText
+            clip_to_frame        = _as_bool(parameters[6].value, True)
+            out_ws               = parameters[7].valueAsText or arcpy.env.scratchGDB
+            out_name             = parameters[8].valueAsText
+            add_to_map           = _as_bool(parameters[9].value, True)
 
             if not brush_fc_layer:
                 raise arcpy.ExecuteError(u"Brush feature is required.")
@@ -436,9 +538,9 @@ class AOIBrushBuilder(object):
             if frame_fc_layer:
                 _announce_selection(u"Frame", frame_fc_layer)
 
-            brush_fc = _resolve_full_source(brush_fc_layer)
+            brush_fc     = _resolve_full_source(brush_fc_layer)
             existing_aoi = _resolve_full_source(existing_aoi_layer) if existing_aoi_layer else None
-            frame_fc = _resolve_full_source(frame_fc_layer) if frame_fc_layer else None
+            frame_fc     = _resolve_full_source(frame_fc_layer) if frame_fc_layer else None
 
             scratch = _ensure_scratch()
             _diag(u"Scratch (disk): {0}".format(scratch))
@@ -460,27 +562,40 @@ class AOIBrushBuilder(object):
 
             brush_geom_type = (desc.shapeType or "").upper()
             brush_poly = _scratch_unique("brush_poly")
+            intermediates.append(brush_poly)
 
             if brush_geom_type in ("POLYLINE", "LINE", "POINT", "MULTIPOINT"):
                 if brush_radius_mu <= 0:
                     raise arcpy.ExecuteError(
                         u"Brush Radius must be > 0 for Polyline/Point brush strokes.")
                 _msg(u"Buffering brush strokes (radius = {0})...".format(brush_radius_mu))
-                arcpy.analysis.Buffer(brush_fc, brush_poly,
-                                      float(brush_radius_mu), dissolve_option="ALL")
+                try:
+                    arcpy.analysis.Buffer(
+                        brush_fc, brush_poly,
+                        float(brush_radius_mu), dissolve_option="ALL")
+                except (arcpy.ExecuteError, RuntimeError):
+                    raise
             elif brush_geom_type == "POLYGON":
                 _msg(u"Dissolving polygon brush strokes...")
-                arcpy.management.Dissolve(brush_fc, brush_poly)
+                try:
+                    arcpy.management.Dissolve(brush_fc, brush_poly)
+                except (arcpy.ExecuteError, RuntimeError):
+                    raise
             else:
                 raise arcpy.ExecuteError(
                     u"Unsupported brush geometry type: {0}".format(brush_geom_type))
 
             brush_poly2 = _scratch_unique("brush_poly_diss")
-            arcpy.management.Dissolve(brush_poly, brush_poly2)
+            intermediates.append(brush_poly2)
+            try:
+                arcpy.management.Dissolve(brush_poly, brush_poly2)
+            except (arcpy.ExecuteError, RuntimeError):
+                raise
             _safe_delete(brush_poly)
             brush_poly = brush_poly2
 
             out_aoi_tmp = _scratch_unique("aoi_tmp")
+            intermediates.append(out_aoi_tmp)
             if operation == "Create new AOI (from brush)":
                 arcpy.management.CopyFeatures(brush_poly, out_aoi_tmp)
             elif operation == "Replace existing AOI (overwrite with brush)":
@@ -491,32 +606,40 @@ class AOIBrushBuilder(object):
                 if not existing_aoi:
                     raise arcpy.ExecuteError(u"Existing AOI is required for Add operation.")
                 union_fc = _scratch_unique("aoi_union")
+                intermediates.append(union_fc)
                 _msg(u"Union: existing AOI + brush...")
-                arcpy.analysis.Union([existing_aoi, brush_poly], union_fc, "ALL", "", "GAPS")
-                arcpy.management.Dissolve(union_fc, out_aoi_tmp)
-                _safe_delete(union_fc)
+                try:
+                    arcpy.analysis.Union(
+                        [existing_aoi, brush_poly], union_fc, "ALL", "", "GAPS")
+                    arcpy.management.Dissolve(union_fc, out_aoi_tmp)
+                except (arcpy.ExecuteError, RuntimeError):
+                    raise
             elif operation == "Subtract brush from existing AOI":
                 if not existing_aoi:
                     raise arcpy.ExecuteError(u"Existing AOI is required for Subtract operation.")
                 try:
                     prod = arcpy.ProductInfo()
-                except Exception:
+                except (RuntimeError, arcpy.ExecuteError):
                     prod = None
                 if prod != "ArcInfo":
                     _warn(u"Advanced license not detected. Subtract uses Erase and may fail.")
                 _msg(u"Erase: existing AOI MINUS brush...")
-                arcpy.analysis.Erase(existing_aoi, brush_poly, out_aoi_tmp)
+                try:
+                    arcpy.analysis.Erase(existing_aoi, brush_poly, out_aoi_tmp)
+                except (arcpy.ExecuteError, RuntimeError):
+                    raise
             else:
                 raise arcpy.ExecuteError(u"Unknown Operation Mode.")
 
             if clip_to_frame and frame_fc:
                 _msg(u"Clipping AOI to frame...")
                 out_aoi_clipped = _scratch_unique("aoi_clip")
+                intermediates.append(out_aoi_clipped)
                 try:
                     arcpy.analysis.Clip(out_aoi_tmp, frame_fc, out_aoi_clipped)
                     _safe_delete(out_aoi_tmp)
                     out_aoi_tmp = out_aoi_clipped
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     _warn(u"Clip to frame failed; using unclipped AOI. {0}".format(
                         traceback.format_exc()))
 
@@ -524,13 +647,11 @@ class AOIBrushBuilder(object):
             if arcpy.Exists(out_aoi_fc):
                 arcpy.management.Delete(out_aoi_fc)
             arcpy.management.CopyFeatures(out_aoi_tmp, out_aoi_fc)
-            _safe_delete(out_aoi_tmp)
-            _safe_delete(brush_poly)
 
             _diag(u"AOI built. Output: {0}".format(out_aoi_fc))
             try:
                 _diag(u"AOI feature count: {0}".format(_get_count(out_aoi_fc)))
-            except Exception:
+            except (RuntimeError, arcpy.ExecuteError):
                 pass
 
             if add_to_map:
@@ -538,43 +659,52 @@ class AOIBrushBuilder(object):
 
             _msg(u"AOI created. Output: {0}".format(out_aoi_fc))
 
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
             _err(traceback.format_exc())
             raise
+        finally:
+            # MASTER RULE 6: explicit cleanup of every intermediate.
+            for p in intermediates:
+                _safe_delete(p)
+            _flush_in_memory()
+            gc.collect()
+            _restore_gp_env(env_snap)
+
 
 
 
 # =============================================================================
-# 5. Tool 2: Safe Contour Cleaner
+# 6. Tool 2: Safe Contour Cleaner
 # =============================================================================
 
 class SafeContourCleaner(object):
     """Build a cleaned COPY of contour line layers for cartographic output."""
 
     # Parameter indices
-    IDX_IN_CONTOURS     = 0
-    IDX_FRAME_POLY      = 1
-    IDX_SAFE_MU         = 2
-    IDX_SAFE_MM         = 3
-    IDX_DENSE_TH        = 4
-    IDX_MIN_NEIGHBORS   = 5
-    IDX_AOI_MODE        = 6
-    IDX_CUSTOM_AOI      = 7
-    IDX_MASK_MODE       = 8
-    IDX_EXTERNAL_MASK   = 9
-    IDX_ELIGIBLE_SQL    = 10
-    IDX_PROTECTED_SQL   = 11
-    IDX_REMOVAL_METHOD  = 12
-    IDX_MIN_SEG_LEN     = 13
-    IDX_OUT_WS          = 14
-    IDX_OUT_NAME        = 15
-    IDX_CREATE_REMOVED  = 16
-    IDX_CREATE_REVIEW   = 17
-    IDX_CREATE_MASK_OUT = 18
-    IDX_WRITE_REPORT    = 19
-    IDX_ADD_TO_MAP      = 20
-    IDX_DRY_RUN         = 21
-    IDX_NEAR_CHUNK      = 22
+    IDX_IN_CONTOURS         = 0
+    IDX_FRAME_POLY          = 1
+    IDX_SAFE_MU             = 2
+    IDX_SAFE_MM             = 3
+    IDX_DENSE_TH            = 4
+    IDX_MIN_NEIGHBORS       = 5
+    IDX_AOI_MODE            = 6
+    IDX_CUSTOM_AOI          = 7
+    IDX_MASK_MODE           = 8
+    IDX_EXTERNAL_MASK       = 9
+    IDX_ELIGIBLE_SQL        = 10
+    IDX_PROTECTED_SQL       = 11
+    IDX_REMOVAL_METHOD      = 12
+    IDX_MIN_SEG_LEN         = 13
+    IDX_OUT_WS              = 14
+    IDX_OUT_NAME            = 15
+    IDX_CREATE_REMOVED      = 16
+    IDX_CREATE_REVIEW       = 17
+    IDX_CREATE_MASK_OUT     = 18
+    IDX_WRITE_REPORT        = 19
+    IDX_ADD_TO_MAP          = 20
+    IDX_DRY_RUN             = 21
+    IDX_NEAR_CHUNK          = 22
+    IDX_ALLOW_FULL_MAP      = 23
 
     def __init__(self):
         self.label = u"Safe Contour Cleaner (Print-Ready) - v5 hardened"
@@ -582,11 +712,14 @@ class SafeContourCleaner(object):
             u"Build a cleaned COPY of contour line layers for print, leaving "
             u"the originals untouched. Removes dense / overlapping segments "
             u"inside an AOI while protecting a safety band inside the frame.\n\n"
-            u"v5 hardening:\n"
-            u" - SELECTION-BYPASS hardwired (FULL datasets always processed)\n"
-            u" - All intermediates land in scratchGDB on disk\n"
-            u" - Chunked Near table for huge eligible sets\n"
-            u" - Stage-by-stage [DIAG] logging"
+            u"v5 master-rules:\n"
+            u" - Narrow exceptions; MemoryError / OSError propagate.\n"
+            u" - Selection-bypass hardwired (FULL datasets always processed).\n"
+            u" - All intermediates land in scratchGDB on disk.\n"
+            u" - Single dissolve+clip strategy (no per-feature clip loop).\n"
+            u" - AOI optionality: 'Allow Full-Map Processing' fallback.\n"
+            u" - Sliver removal at XYTolerance after clip.\n"
+            u" - GP env snapshot/restore + in_memory flush in finally."
         )
         self.canRunInBackground = True
 
@@ -630,59 +763,166 @@ class SafeContourCleaner(object):
             ic.insertRow([poly])
         return out_fc
 
-    def _clip_like(self, in_fc, clip_fc, out_fc):
-        """Clip with fallback to SelectByLocation+CopyFeatures."""
+    def _dissolve_to_single_multipart(self, in_fc, out_fc):
+        """
+        MASTER RULE: dissolve any polygon FC down to ONE multipart polygon.
+        This is the canonical clip-mask geometry: a single feature with all
+        AOI islands as parts. Allows a single arcpy.analysis.Clip call.
+        """
         try:
-            arcpy.analysis.Clip(in_fc, clip_fc, out_fc)
+            arcpy.management.Dissolve(in_fc, out_fc, multi_part="MULTI_PART")
+        except (arcpy.ExecuteError, RuntimeError):
+            # Fallback: copy as-is (caller may still pass it to Clip).
+            _warn(u"Dissolve to multipart failed; using raw AOI.")
+            arcpy.management.CopyFeatures(in_fc, out_fc)
+        return out_fc
+
+    def _single_clip(self, in_fc, clip_multipart_fc, out_fc):
+        """
+        Single arcpy.analysis.Clip call against a pre-dissolved multipart
+        polygon. NO per-feature looping. MASTER RULE for the memory leak fix.
+        """
+        try:
+            arcpy.analysis.Clip(in_fc, clip_multipart_fc, out_fc)
             return out_fc
-        except Exception:
-            _warn(u"Clip failed; falling back to SelectByLocation + CopyFeatures.")
+        except (arcpy.ExecuteError, RuntimeError):
+            _warn(u"Single Clip failed; falling back to "
+                  u"SelectByLocation+CopyFeatures (no looping). {0}".format(
+                      traceback.format_exc()))
             lyr = _unique("lyr_clipfb")
             try:
                 arcpy.management.MakeFeatureLayer(in_fc, lyr)
-                arcpy.management.SelectLayerByLocation(lyr, "INTERSECT", clip_fc)
+                arcpy.management.SelectLayerByLocation(
+                    lyr, "INTERSECT", clip_multipart_fc)
                 arcpy.management.CopyFeatures(lyr, out_fc)
             finally:
                 try:
                     arcpy.management.Delete(lyr)
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     pass
             return out_fc
 
-    def _safe_zone_from_frame(self, frame_fc, safe_margin, out_safe_zone_fc):
+    def _remove_slivers(self, fc, xy_tolerance):
+        """
+        Remove tiny artifacts shorter/smaller than XYTolerance. Runs inline
+        with a SearchCursor (no big dict / no per-feature GP). MASTER RULE.
+        """
+        if not fc or not arcpy.Exists(fc):
+            return 0
+        if xy_tolerance is None or float(xy_tolerance) <= 0:
+            return 0
+        tol = float(xy_tolerance)
+        try:
+            shape_type = (arcpy.Describe(fc).shapeType or "").upper()
+        except (RuntimeError, arcpy.ExecuteError):
+            return 0
+        oid_field = arcpy.Describe(fc).OIDFieldName
+
+        # Stream through with a cursor; only collect short OIDs, not geometry.
+        sliver_oids = []
+        if shape_type in ("POLYLINE", "LINE"):
+            with arcpy.da.SearchCursor(fc, [oid_field, "SHAPE@LENGTH"]) as cur:
+                for oidv, lng in cur:
+                    if lng is None:
+                        sliver_oids.append(int(oidv))
+                    elif float(lng) < tol:
+                        sliver_oids.append(int(oidv))
+        elif shape_type == "POLYGON":
+            with arcpy.da.SearchCursor(fc, [oid_field, "SHAPE@AREA"]) as cur:
+                for oidv, area in cur:
+                    if area is None:
+                        sliver_oids.append(int(oidv))
+                    elif float(area) < (tol * tol):
+                        sliver_oids.append(int(oidv))
+        else:
+            return 0
+
+        if not sliver_oids:
+            return 0
+
+        lyr = _unique("sliver_lyr")
+        try:
+            arcpy.management.MakeFeatureLayer(fc, lyr)
+            arcpy.management.SelectLayerByAttribute(lyr, "CLEAR_SELECTION")
+            chunks = [sliver_oids[i:i + 999]
+                      for i in xrange(0, len(sliver_oids), 999)]  # noqa: F821
+            first = True
+            for ch in chunks:
+                where = u"{0} IN ({1})".format(
+                    arcpy.AddFieldDelimiters(lyr, oid_field),
+                    u",".join([_to_unicode(x) for x in ch]))
+                arcpy.management.SelectLayerByAttribute(
+                    lyr,
+                    "NEW_SELECTION" if first else "ADD_TO_SELECTION",
+                    where)
+                first = False
+            try:
+                arcpy.management.DeleteFeatures(lyr)
+            except (arcpy.ExecuteError, RuntimeError):
+                _warn(u"DeleteFeatures failed for slivers.")
+        finally:
+            try:
+                arcpy.management.Delete(lyr)
+            except (arcpy.ExecuteError, RuntimeError):
+                pass
+        _diag(u"Slivers removed (< {0:.6f}): {1}".format(tol, len(sliver_oids)))
+        return len(sliver_oids)
+
+    def _safe_zone_from_frame(self, frame_fc, safe_margin, out_safe_zone_fc,
+                              intermediates):
         """Build the no-delete polygon band INSIDE the frame."""
         scratch = arcpy.env.scratchGDB
         dissolved = arcpy.CreateUniqueName(_unique("frame_diss"), scratch)
-        arcpy.management.Dissolve(frame_fc, dissolved)
+        intermediates.append(dissolved)
+        try:
+            arcpy.management.Dissolve(frame_fc, dissolved, multi_part="MULTI_PART")
+        except (arcpy.ExecuteError, RuntimeError):
+            arcpy.management.CopyFeatures(frame_fc, dissolved)
+
         if safe_margin is None or safe_margin <= 0:
             arcpy.management.CopyFeatures(dissolved, out_safe_zone_fc)
-            _safe_delete(dissolved)
             return out_safe_zone_fc
+
         frame_line = arcpy.CreateUniqueName(_unique("frame_line"), scratch)
-        arcpy.management.PolygonToLine(dissolved, frame_line)
-        band = arcpy.CreateUniqueName(_unique("frame_band"), scratch)
+        intermediates.append(frame_line)
         try:
-            arcpy.analysis.Buffer(frame_line, band, abs(float(safe_margin)),
-                                  dissolve_option="ALL")
-        except Exception:
+            arcpy.management.PolygonToLine(dissolved, frame_line)
+        except (arcpy.ExecuteError, RuntimeError):
+            _warn(u"PolygonToLine failed; using full frame as safe zone.")
+            arcpy.management.CopyFeatures(dissolved, out_safe_zone_fc)
+            return out_safe_zone_fc
+
+        band = arcpy.CreateUniqueName(_unique("frame_band"), scratch)
+        intermediates.append(band)
+        try:
+            arcpy.analysis.Buffer(
+                frame_line, band, abs(float(safe_margin)),
+                dissolve_option="ALL")
+        except (arcpy.ExecuteError, RuntimeError):
             _warn(u"Buffer failed for safe zone; using full frame as safe zone.")
             arcpy.management.CopyFeatures(dissolved, out_safe_zone_fc)
-            _safe_delete(dissolved); _safe_delete(frame_line); _safe_delete(band)
             return out_safe_zone_fc
+
         try:
             arcpy.analysis.Clip(band, dissolved, out_safe_zone_fc)
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
             _warn(u"Clip failed for safe zone; using full frame as safe zone.")
             arcpy.management.CopyFeatures(dissolved, out_safe_zone_fc)
-        _safe_delete(dissolved); _safe_delete(frame_line); _safe_delete(band)
         return out_safe_zone_fc
 
+
+
     def _build_dense_mask(self, eligible_fc, threshold, min_neighbors,
-                           out_mask_fc, aoi_fc=None, near_chunk=50000):
+                           out_mask_fc, aoi_fc=None, near_chunk=50000,
+                           intermediates=None):
         """
         Build dense-zone mask from eligible contours using GenerateNearTable
         with optional OID-bounded chunking for huge eligible sets.
+        Selection on inputs is bypassed (caller passes catalogPaths).
         """
+        if intermediates is None:
+            intermediates = []
+
         if threshold is None or float(threshold) <= 0:
             raise arcpy.ExecuteError(u"Dense threshold must be > 0.")
         if min_neighbors is None or int(min_neighbors) < 1:
@@ -691,11 +931,14 @@ class SafeContourCleaner(object):
 
         scratch = arcpy.env.scratchGDB
 
-        # Optional clip-to-AOI for speed
+        # Optional clip-to-AOI for speed (still single-clip, dissolved AOI
+        # provided by caller).
         working_fc = eligible_fc
+        local_clip = None
         if aoi_fc:
-            tmp_clip = arcpy.CreateUniqueName(_unique("eligible_clip"), scratch)
-            working_fc = self._clip_like(eligible_fc, aoi_fc, tmp_clip)
+            local_clip = arcpy.CreateUniqueName(_unique("eligible_clip"), scratch)
+            intermediates.append(local_clip)
+            working_fc = self._single_clip(eligible_fc, aoi_fc, local_clip)
 
         sr = arcpy.Describe(eligible_fc).spatialReference
         count = _get_count(working_fc)
@@ -710,13 +953,12 @@ class SafeContourCleaner(object):
         # Spatial index for downstream operations
         try:
             arcpy.management.AddSpatialIndex(working_fc)
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
             pass
 
-        # GenerateNearTable in chunks if needed
         try:
             oid_field = arcpy.Describe(working_fc).OIDFieldName
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             oid_field = "OBJECTID"
 
         from collections import defaultdict
@@ -737,13 +979,17 @@ class SafeContourCleaner(object):
 
         if count <= near_chunk:
             near_tbl = arcpy.CreateUniqueName(_unique("near"), scratch)
-            arcpy.analysis.GenerateNearTable(
-                working_fc, working_fc, near_tbl,
-                search_radius=float(threshold),
-                location="NO_LOCATION", angle="NO_ANGLE",
-                closest="CLOSEST", closest_count=min_neighbors + 1)
-            _process_near_table(near_tbl)
-            _safe_delete(near_tbl)
+            try:
+                arcpy.analysis.GenerateNearTable(
+                    working_fc, working_fc, near_tbl,
+                    search_radius=float(threshold),
+                    location="NO_LOCATION", angle="NO_ANGLE",
+                    closest="CLOSEST", closest_count=min_neighbors + 1)
+                _process_near_table(near_tbl)
+            except (arcpy.ExecuteError, RuntimeError):
+                _warn(u"GenerateNearTable failed: {0}".format(traceback.format_exc()))
+            finally:
+                _safe_delete(near_tbl)
         else:
             # Enumerate OIDs in order
             oids = []
@@ -753,7 +999,8 @@ class SafeContourCleaner(object):
             oids.sort()
             n = len(oids)
             _diag(u"Chunked Near: {0} features, chunk={1}".format(n, near_chunk))
-            i = 0; chunk_idx = 0
+            i = 0
+            chunk_idx = 0
             while i < n:
                 chunk = oids[i:i + near_chunk]
                 i += near_chunk
@@ -774,14 +1021,14 @@ class SafeContourCleaner(object):
                     _process_near_table(near_tbl)
                     _diag(u"  Near chunk {0}: OIDs {1}..{2} ({3} feats)".format(
                         chunk_idx, lo, hi, len(chunk)))
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     _warn(u"Near chunk {0} failed: {1}".format(
                         chunk_idx, traceback.format_exc()))
                 finally:
                     _safe_delete(near_tbl)
                     try:
                         arcpy.management.Delete(sel_lyr)
-                    except Exception:
+                    except (arcpy.ExecuteError, RuntimeError):
                         pass
                     gc.collect()
 
@@ -794,17 +1041,15 @@ class SafeContourCleaner(object):
             arcpy.management.CreateFeatureclass(
                 os.path.dirname(out_mask_fc), os.path.basename(out_mask_fc),
                 "POLYGON", spatial_reference=sr)
-            if aoi_fc and working_fc != eligible_fc:
-                _safe_delete(working_fc)
             return out_mask_fc
 
         # Select dense features -> buffer -> copy to mask
         dense_layer = _unique("dense_lyr")
-        arcpy.management.MakeFeatureLayer(working_fc, dense_layer)
         try:
+            arcpy.management.MakeFeatureLayer(working_fc, dense_layer)
             arcpy.management.SelectLayerByAttribute(dense_layer, "CLEAR_SELECTION")
             chunks = [dense_oids[i:i + 999]
-                      for i in range(0, len(dense_oids), 999)]
+                      for i in xrange(0, len(dense_oids), 999)]  # noqa: F821
             first = True
             for ch in chunks:
                 where = u"{0} IN ({1})".format(
@@ -817,18 +1062,18 @@ class SafeContourCleaner(object):
                 first = False
 
             tmp_buf = arcpy.CreateUniqueName(_unique("dense_buf"), scratch)
-            arcpy.analysis.Buffer(
-                dense_layer, tmp_buf, float(threshold) / 2.0,
-                dissolve_option="ALL")
-            arcpy.management.CopyFeatures(tmp_buf, out_mask_fc)
-            _safe_delete(tmp_buf)
+            try:
+                arcpy.analysis.Buffer(
+                    dense_layer, tmp_buf, float(threshold) / 2.0,
+                    dissolve_option="ALL")
+                arcpy.management.CopyFeatures(tmp_buf, out_mask_fc)
+            finally:
+                _safe_delete(tmp_buf)
         finally:
             try:
                 arcpy.management.Delete(dense_layer)
-            except Exception:
+            except (arcpy.ExecuteError, RuntimeError):
                 pass
-            if aoi_fc and working_fc != eligible_fc:
-                _safe_delete(working_fc)
 
         return out_mask_fc
 
@@ -843,17 +1088,16 @@ class SafeContourCleaner(object):
         try:
             arcpy.management.MakeFeatureLayer(out_lines_fc, lyr)
             short_oids = []
-            with arcpy.da.SearchCursor(out_lines_fc, [oid_field, "SHAPE@"]) as cur:
-                for oidv, geom in cur:
-                    try:
-                        if geom and geom.length < float(min_length):
-                            short_oids.append(int(oidv))
-                    except Exception:
-                        pass
+            with arcpy.da.SearchCursor(out_lines_fc, [oid_field, "SHAPE@LENGTH"]) as cur:
+                for oidv, lng in cur:
+                    if lng is None:
+                        continue
+                    if float(lng) < float(min_length):
+                        short_oids.append(int(oidv))
             if not short_oids:
                 return out_lines_fc
             chunks = [short_oids[i:i + 999]
-                      for i in range(0, len(short_oids), 999)]
+                      for i in xrange(0, len(short_oids), 999)]  # noqa: F821
             arcpy.management.SelectLayerByAttribute(lyr, "CLEAR_SELECTION")
             first = True
             for ch in chunks:
@@ -865,11 +1109,14 @@ class SafeContourCleaner(object):
                     "NEW_SELECTION" if first else "ADD_TO_SELECTION",
                     where)
                 first = False
-            arcpy.management.DeleteFeatures(lyr)
+            try:
+                arcpy.management.DeleteFeatures(lyr)
+            except (arcpy.ExecuteError, RuntimeError):
+                _warn(u"DeleteFeatures failed for short segments.")
         finally:
             try:
                 arcpy.management.Delete(lyr)
-            except Exception:
+            except (arcpy.ExecuteError, RuntimeError):
                 pass
         return out_lines_fc
 
@@ -882,7 +1129,7 @@ class SafeContourCleaner(object):
                 for r in cur:
                     if r[0] is not None:
                         total += float(r[0])
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             pass
         return total
 
@@ -891,7 +1138,8 @@ class SafeContourCleaner(object):
                     dense_th, min_neighbors, safe_mu,
                     aoi_mode, mask_mode, removal_method,
                     min_seg_length, removed_len,
-                    out_clean_fc, out_removed_fc, out_review_fc, out_mask_fc):
+                    out_clean_fc, out_removed_fc, out_review_fc, out_mask_fc,
+                    full_map_fallback_used, sliver_count):
         out_ws_low = (_to_unicode(out_ws) or u"").lower()
         if u".gdb" in out_ws_low:
             parent = os.path.dirname(_to_unicode(out_ws).rstrip(u"\\/"))
@@ -900,7 +1148,7 @@ class SafeContourCleaner(object):
             report_path = os.path.join(out_ws, base_name + "_Report.csv")
         with open(report_path, "wb") as f:
             w = csv.writer(f)
-            w.writerow(["Tool", "Safe Contour Cleaner (v5 hardened)"])
+            w.writerow(["Tool", "Safe Contour Cleaner (v5 hardened, master rules)"])
             w.writerow(["DateTime", str(datetime.datetime.now())])
             w.writerow([])
             w.writerow(["InputContoursCount", total_in])
@@ -914,12 +1162,16 @@ class SafeContourCleaner(object):
             w.writerow(["RemovalMethod", _ascii_safe(removal_method)])
             w.writerow(["MinSegmentLength", min_seg_length])
             w.writerow(["RemovedLengthApprox", removed_len])
+            w.writerow(["FullMapFallbackUsed", bool(full_map_fallback_used)])
+            w.writerow(["SliversRemoved", sliver_count])
             w.writerow([])
             w.writerow(["OutputCleanFC", _ascii_safe(out_clean_fc)])
             w.writerow(["OutputRemovedFC", _ascii_safe(out_removed_fc or "")])
             w.writerow(["OutputReviewFC", _ascii_safe(out_review_fc or "")])
             w.writerow(["OutputMaskFC", _ascii_safe(out_mask_fc or "")])
         return report_path
+
+
 
     # --- Parameters --------------------------------------------------------
 
@@ -1106,6 +1358,18 @@ class SafeContourCleaner(object):
         p22.description = u"For very large eligible sets, GenerateNearTable runs in OID-bounded chunks of this size."
         params.append(p22)
 
+        p23 = arcpy.Parameter(
+            displayName=u"Allow Full-Map Processing if AOI is Empty",
+            name="allow_full_map_processing", datatype="GPBoolean",
+            parameterType="Optional", direction="Input")
+        p23.category = "9) Safety Overrides"; p23.value = False
+        p23.description = (
+            u"If False (default): empty AOI raises an error. "
+            u"If True: tool falls back to the active map's extent and "
+            u"processes the full map, with a loud warning. Off by default "
+            u"to prevent accidental whole-dataset edits.")
+        params.append(p23)
+
         return params
 
     def updateParameters(self, parameters):
@@ -1116,17 +1380,20 @@ class SafeContourCleaner(object):
                 "Custom AOI only", "Frame AND Custom AOI")
             parameters[self.IDX_EXTERNAL_MASK].enabled = (
                 mask_mode == "Use external mask polygon")
-        except Exception:
+        except (RuntimeError, AttributeError, arcpy.ExecuteError):
             pass
 
     def updateMessages(self, parameters):
         try:
             aoi_mode = parameters[self.IDX_AOI_MODE].valueAsText
             frame = parameters[self.IDX_FRAME_POLY].valueAsText
-            if aoi_mode and "Frame" in aoi_mode and not frame:
+            allow_full = _as_bool(
+                parameters[self.IDX_ALLOW_FULL_MAP].value, False)
+            if aoi_mode and "Frame" in aoi_mode and not frame and not allow_full:
                 parameters[self.IDX_FRAME_POLY].setWarningMessage(
                     u"AOI Mode uses Frame but Frame/Neatline polygon is not "
-                    u"provided. Tool will fall back to active DataFrame extent.")
+                    u"provided. Tool will fail at execute() unless you set "
+                    u"'Allow Full-Map Processing if AOI is Empty' to True.")
             dense_th = parameters[self.IDX_DENSE_TH].value
             safe_mu = parameters[self.IDX_SAFE_MU].value or 0.0
             if dense_th and float(dense_th) < float(safe_mu):
@@ -1137,7 +1404,7 @@ class SafeContourCleaner(object):
             if ncs is not None and int(ncs) < 1000:
                 parameters[self.IDX_NEAR_CHUNK].setWarningMessage(
                     u"Very small chunk size will be slow; recommend >= 5000.")
-        except Exception:
+        except (RuntimeError, AttributeError, arcpy.ExecuteError, ValueError):
             pass
 
 
@@ -1145,37 +1412,46 @@ class SafeContourCleaner(object):
     # --- Execute -----------------------------------------------------------
 
     def execute(self, parameters, messages):
+        # MASTER RULE 4: snapshot env at entry, neutralize, restore in finally.
+        env_snap = _snapshot_gp_env()
         arcpy.env.overwriteOutput = True
         try:
             arcpy.env.parallelProcessingFactor = "100%"
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             pass
+
+        # MASTER RULE 6: track every intermediate so finally can delete them.
+        intermediates = []
+        full_map_fallback_used = False
+        sliver_count = 0
 
         try:
             # Read parameters
-            in_contours_mv = parameters[self.IDX_IN_CONTOURS].valueAsText
-            frame_layer = parameters[self.IDX_FRAME_POLY].valueAsText
-            safe_mu = float(parameters[self.IDX_SAFE_MU].value or 0.0)
-            safe_mm = float(parameters[self.IDX_SAFE_MM].value or 0.0)
-            dense_threshold = float(parameters[self.IDX_DENSE_TH].value)
-            min_neighbors = int(parameters[self.IDX_MIN_NEIGHBORS].value or 1)
-            aoi_mode = parameters[self.IDX_AOI_MODE].valueAsText
-            custom_aoi_layer = parameters[self.IDX_CUSTOM_AOI].valueAsText
-            mask_mode = parameters[self.IDX_MASK_MODE].valueAsText
-            external_mask_layer = parameters[self.IDX_EXTERNAL_MASK].valueAsText
-            eligible_sql = parameters[self.IDX_ELIGIBLE_SQL].valueAsText or "1=1"
-            protected_sql = parameters[self.IDX_PROTECTED_SQL].valueAsText or ""
-            removal_method = parameters[self.IDX_REMOVAL_METHOD].valueAsText
-            min_seg_length = float(parameters[self.IDX_MIN_SEG_LEN].value or 0.0)
-            out_ws = parameters[self.IDX_OUT_WS].valueAsText or arcpy.env.scratchGDB
-            out_clean_name = parameters[self.IDX_OUT_NAME].valueAsText
-            create_removed = _as_bool(parameters[self.IDX_CREATE_REMOVED].value, True)
-            create_review = _as_bool(parameters[self.IDX_CREATE_REVIEW].value, True)
-            create_maskout = _as_bool(parameters[self.IDX_CREATE_MASK_OUT].value, True)
-            write_report = _as_bool(parameters[self.IDX_WRITE_REPORT].value, True)
-            add_to_map = _as_bool(parameters[self.IDX_ADD_TO_MAP].value, True)
-            dry_run = _as_bool(parameters[self.IDX_DRY_RUN].value, False)
-            near_chunk = int(parameters[self.IDX_NEAR_CHUNK].value or 50000)
+            in_contours_mv          = parameters[self.IDX_IN_CONTOURS].valueAsText
+            frame_layer             = parameters[self.IDX_FRAME_POLY].valueAsText
+            safe_mu                 = float(parameters[self.IDX_SAFE_MU].value or 0.0)
+            safe_mm                 = float(parameters[self.IDX_SAFE_MM].value or 0.0)
+            dense_threshold         = float(parameters[self.IDX_DENSE_TH].value)
+            min_neighbors           = int(parameters[self.IDX_MIN_NEIGHBORS].value or 1)
+            aoi_mode                = parameters[self.IDX_AOI_MODE].valueAsText
+            custom_aoi_layer        = parameters[self.IDX_CUSTOM_AOI].valueAsText
+            mask_mode               = parameters[self.IDX_MASK_MODE].valueAsText
+            external_mask_layer     = parameters[self.IDX_EXTERNAL_MASK].valueAsText
+            eligible_sql            = parameters[self.IDX_ELIGIBLE_SQL].valueAsText or "1=1"
+            protected_sql           = parameters[self.IDX_PROTECTED_SQL].valueAsText or ""
+            removal_method          = parameters[self.IDX_REMOVAL_METHOD].valueAsText
+            min_seg_length          = float(parameters[self.IDX_MIN_SEG_LEN].value or 0.0)
+            out_ws                  = parameters[self.IDX_OUT_WS].valueAsText or arcpy.env.scratchGDB
+            out_clean_name          = parameters[self.IDX_OUT_NAME].valueAsText
+            create_removed          = _as_bool(parameters[self.IDX_CREATE_REMOVED].value, True)
+            create_review           = _as_bool(parameters[self.IDX_CREATE_REVIEW].value, True)
+            create_maskout          = _as_bool(parameters[self.IDX_CREATE_MASK_OUT].value, True)
+            write_report            = _as_bool(parameters[self.IDX_WRITE_REPORT].value, True)
+            add_to_map              = _as_bool(parameters[self.IDX_ADD_TO_MAP].value, True)
+            dry_run                 = _as_bool(parameters[self.IDX_DRY_RUN].value, False)
+            near_chunk              = int(parameters[self.IDX_NEAR_CHUNK].value or 50000)
+            allow_full_map_processing = _as_bool(
+                parameters[self.IDX_ALLOW_FULL_MAP].value, False)
 
             # Validate inputs
             in_contour_layers = self._split_multivalue(in_contours_mv)
@@ -1219,57 +1495,141 @@ class SafeContourCleaner(object):
                 else:
                     _warn(u"Could not convert Safe Margin (mm). Using map-units value only.")
 
-            # Frame fallback: active DataFrame extent
-            if (not frame_fc) and aoi_mode and "Frame" in aoi_mode:
-                try:
-                    import arcpy.mapping as mapping
-                    mxd = mapping.MapDocument("CURRENT")
-                    df = mxd.activeDataFrame
-                    ext = df.extent
-                    frame_fc = arcpy.CreateUniqueName(_unique("frame_extent"), scratch)
-                    self._extent_to_polygon_fc(ext, frame_fc, sr)
-                    _warn(u"Frame polygon not provided. Using active DataFrame extent as frame.")
-                except Exception:
-                    raise arcpy.ExecuteError(
-                        u"Frame polygon is required OR run inside ArcMap with an "
-                        u"active DataFrame.")
+            # ----------------------------------------------------------------
+            # AOI RESOLUTION (with optional full-map fallback)
+            # ----------------------------------------------------------------
+            # Compute the candidate AOI from the chosen AOI Mode WITHOUT
+            # falling back to anything yet. If the result is empty, we apply
+            # the allow_full_map_processing rule.
+            # ----------------------------------------------------------------
 
-            # Build safe zone
-            safe_zone_fc = None
-            if frame_fc:
-                safe_zone_fc = arcpy.CreateUniqueName(_unique("safe_zone"), scratch)
-                self._safe_zone_from_frame(frame_fc, safe_mu, safe_zone_fc)
+            aoi_fc = None  # will hold the dissolved single-multipart AOI
 
-            # Compute AOI polygon by mode
-            aoi_fc = None
+            # First, determine if the chosen AOI mode demands a polygon:
             if aoi_mode == "Frame only (default)":
-                aoi_fc = frame_fc
+                if frame_fc and _get_count(frame_fc) > 0:
+                    aoi_raw = frame_fc
+                else:
+                    aoi_raw = None
             elif aoi_mode == "Custom AOI only":
-                if not custom_aoi_fc:
-                    raise arcpy.ExecuteError(
-                        u"Custom AOI mode selected but Custom AOI polygon not provided.")
-                aoi_fc = custom_aoi_fc
+                if custom_aoi_fc and _get_count(custom_aoi_fc) > 0:
+                    aoi_raw = custom_aoi_fc
+                else:
+                    aoi_raw = None
             elif aoi_mode == "Frame AND Custom AOI":
-                if not (frame_fc and custom_aoi_fc):
-                    raise arcpy.ExecuteError(
-                        u"Frame AND Custom AOI requires BOTH Frame polygon and Custom AOI polygon.")
-                aoi_fc = arcpy.CreateUniqueName(_unique("aoi_int"), scratch)
-                arcpy.analysis.Intersect([frame_fc, custom_aoi_fc], aoi_fc,
-                                         join_attributes="ONLY_FID")
+                if (frame_fc and custom_aoi_fc
+                        and _get_count(frame_fc) > 0
+                        and _get_count(custom_aoi_fc) > 0):
+                    aoi_int = arcpy.CreateUniqueName(_unique("aoi_int"), scratch)
+                    intermediates.append(aoi_int)
+                    try:
+                        arcpy.analysis.Intersect(
+                            [frame_fc, custom_aoi_fc], aoi_int,
+                            join_attributes="ONLY_FID")
+                        if _get_count(aoi_int) > 0:
+                            aoi_raw = aoi_int
+                        else:
+                            aoi_raw = None
+                    except (arcpy.ExecuteError, RuntimeError):
+                        _warn(u"Intersect of Frame AND Custom AOI failed.")
+                        aoi_raw = None
+                else:
+                    aoi_raw = None
+            elif aoi_mode == "Entire dataset (no AOI)":
+                aoi_raw = None
             else:
-                aoi_fc = None
+                aoi_raw = None
 
-            # Merge contours + clip to AOI (on disk)
+            # Apply optionality rule: empty AOI handling
+            if aoi_raw is None and aoi_mode != "Entire dataset (no AOI)":
+                if not allow_full_map_processing:
+                    raise arcpy.ExecuteError(
+                        u"AOI is empty for AOI Mode '{0}'. Provide a Frame "
+                        u"and/or Custom AOI, OR set 'Allow Full-Map "
+                        u"Processing if AOI is Empty' to True to fall back "
+                        u"to the active map extent.".format(
+                            _ascii_safe(aoi_mode)))
+                # Loud warning + fall back to active DataFrame extent
+                _warn(u"#" * 70)
+                _warn(u"WARNING: AOI is empty. 'Allow Full-Map Processing' is True.")
+                _warn(u"Falling back to the ACTIVE MAP EXTENT and processing the FULL MAP.")
+                _warn(u"This will edit contours across the entire visible extent. ")
+                _warn(u"Re-run with a proper AOI for safer cartographic edits.")
+                _warn(u"#" * 70)
+                try:
+                    fallback_fc = arcpy.CreateUniqueName(
+                        _unique("aoi_full_map_fallback"), scratch)
+                    intermediates.append(fallback_fc)
+                    _get_df_extent_polygon(fallback_fc, sr)
+                    aoi_raw = fallback_fc
+                    full_map_fallback_used = True
+                except (RuntimeError, arcpy.ExecuteError, AttributeError):
+                    raise arcpy.ExecuteError(
+                        u"Full-map fallback requested, but no active "
+                        u"DataFrame extent available. Run inside ArcMap or "
+                        u"provide a Frame/Custom AOI.")
+
+            # Dissolve AOI to a single multipart polygon for a SINGLE clip pass.
+            if aoi_raw is not None:
+                aoi_fc = arcpy.CreateUniqueName(_unique("aoi_multipart"), scratch)
+                intermediates.append(aoi_fc)
+                self._dissolve_to_single_multipart(aoi_raw, aoi_fc)
+                if _get_count(aoi_fc) == 0:
+                    # Treat as empty AOI; same fallback logic
+                    if not allow_full_map_processing:
+                        raise arcpy.ExecuteError(
+                            u"Resolved AOI is empty after dissolve. Set "
+                            u"'Allow Full-Map Processing if AOI is Empty' "
+                            u"to True to process the full map.")
+                    _warn(u"Dissolved AOI is empty. Falling back to full map extent.")
+                    _safe_delete(aoi_fc)
+                    aoi_fc = arcpy.CreateUniqueName(
+                        _unique("aoi_full_map_fallback"), scratch)
+                    intermediates.append(aoi_fc)
+                    try:
+                        _get_df_extent_polygon(aoi_fc, sr)
+                        full_map_fallback_used = True
+                    except (RuntimeError, arcpy.ExecuteError, AttributeError):
+                        raise arcpy.ExecuteError(
+                            u"Could not build full-map fallback AOI.")
+
+            # Build safe zone (unchanged conceptually; uses the original
+            # frame_fc if provided)
+            safe_zone_fc = None
+            if frame_fc and _get_count(frame_fc) > 0:
+                safe_zone_fc = arcpy.CreateUniqueName(_unique("safe_zone"), scratch)
+                intermediates.append(safe_zone_fc)
+                self._safe_zone_from_frame(
+                    frame_fc, safe_mu, safe_zone_fc, intermediates)
+
+
+
+            # ----------------------------------------------------------------
+            # MERGE INPUTS + SINGLE CLIP TO AOI
+            # ----------------------------------------------------------------
+            # Memory-leak fix: aoi_fc is a SINGLE multipart polygon. We do
+            # ONE arcpy.analysis.Clip on the whole merged dataset. No loops.
+            # ----------------------------------------------------------------
             merged_fc = arcpy.CreateUniqueName(_unique("contours_merge"), scratch)
+            intermediates.append(merged_fc)
             _msg(u"Merging input contours...")
-            arcpy.management.Merge(in_contours, merged_fc)
+            try:
+                arcpy.management.Merge(in_contours, merged_fc)
+            except (arcpy.ExecuteError, RuntimeError):
+                raise
             _diag(u"Merged contour count: {0}".format(_get_count(merged_fc)))
 
             working_all = merged_fc
             if aoi_fc:
                 clipped_all = arcpy.CreateUniqueName(_unique("contours_clip"), scratch)
-                _msg(u"Clipping contours to AOI...")
-                working_all = self._clip_like(merged_fc, aoi_fc, clipped_all)
+                intermediates.append(clipped_all)
+                _msg(u"Single-pass Clip of merged contours to dissolved AOI...")
+                working_all = self._single_clip(merged_fc, aoi_fc, clipped_all)
+
+                # Sliver removal at XYTolerance, immediately after clip.
+                xy_tol = _get_xy_tolerance(working_all, fallback=0.001)
+                _diag(u"Removing slivers shorter than XYTolerance = {0}".format(xy_tol))
+                sliver_count = self._remove_slivers(working_all, xy_tol)
 
             total_in = _get_count(working_all)
             _diag(u"Contours in AOI: {0}".format(total_in))
@@ -1278,21 +1638,24 @@ class SafeContourCleaner(object):
             not_prot = self._make_where_not(protected_sql)
             where_eligible = self._combine_where(eligible_sql, not_prot)
 
+            eligible_fc = arcpy.CreateUniqueName(_unique("eligible"), scratch)
+            intermediates.append(eligible_fc)
+            noneligible_fc = arcpy.CreateUniqueName(_unique("noneligible"), scratch)
+            intermediates.append(noneligible_fc)
+
             lyr_all = _unique("all_lyr")
-            arcpy.management.MakeFeatureLayer(working_all, lyr_all)
             try:
+                arcpy.management.MakeFeatureLayer(working_all, lyr_all)
                 arcpy.management.SelectLayerByAttribute(
                     lyr_all, "NEW_SELECTION", where_eligible)
-                eligible_fc = arcpy.CreateUniqueName(_unique("eligible"), scratch)
                 arcpy.management.CopyFeatures(lyr_all, eligible_fc)
 
                 arcpy.management.SelectLayerByAttribute(lyr_all, "SWITCH_SELECTION")
-                noneligible_fc = arcpy.CreateUniqueName(_unique("noneligible"), scratch)
                 arcpy.management.CopyFeatures(lyr_all, noneligible_fc)
             finally:
                 try:
                     arcpy.management.Delete(lyr_all)
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     pass
 
             eligible_count = _get_count(eligible_fc)
@@ -1302,6 +1665,7 @@ class SafeContourCleaner(object):
 
             # Build removal mask
             mask_fc = arcpy.CreateUniqueName(_unique("mask"), scratch)
+            intermediates.append(mask_fc)
             if mask_mode == "Use external mask polygon":
                 if not external_mask_fc:
                     raise arcpy.ExecuteError(
@@ -1311,13 +1675,15 @@ class SafeContourCleaner(object):
             elif mask_mode == "Use AOI polygon as mask (no auto)":
                 if not aoi_fc:
                     raise arcpy.ExecuteError(
-                        u"AOI is required to use AOI as mask (choose a Frame or Custom AOI mode).")
+                        u"AOI is required to use AOI as mask (choose a Frame or Custom AOI mode "
+                        u"or enable 'Allow Full-Map Processing').")
                 arcpy.management.CopyFeatures(aoi_fc, mask_fc)
             else:
                 _msg(u"Building dense-zone mask (Near Table method)...")
                 self._build_dense_mask(
                     eligible_fc, dense_threshold, min_neighbors,
-                    mask_fc, aoi_fc=aoi_fc, near_chunk=near_chunk)
+                    mask_fc, aoi_fc=aoi_fc, near_chunk=near_chunk,
+                    intermediates=intermediates)
 
             mask_count = _get_count(mask_fc)
             _diag(u"Mask polygons: {0}".format(mask_count))
@@ -1329,9 +1695,10 @@ class SafeContourCleaner(object):
             if (safe_zone_fc and mask_count > 0
                     and _get_count(safe_zone_fc) > 0):
                 final_mask_fc = arcpy.CreateUniqueName(_unique("mask_safe"), scratch)
+                intermediates.append(final_mask_fc)
                 try:
                     arcpy.analysis.Erase(mask_fc, safe_zone_fc, final_mask_fc)
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     _warn(u"Erase failed while subtracting Safe Zone from mask. Using raw mask.")
                     _safe_delete(final_mask_fc)
                     final_mask_fc = mask_fc
@@ -1345,16 +1712,17 @@ class SafeContourCleaner(object):
             review_fc = None
             if create_review and safe_zone_fc and mask_count > 0:
                 review_fc = arcpy.CreateUniqueName(_unique("review"), scratch)
+                intermediates.append(review_fc)
                 try:
                     arcpy.analysis.Intersect(
                         [mask_fc, safe_zone_fc], review_fc,
                         output_type="POLYGON")
-                except Exception:
+                except (arcpy.ExecuteError, RuntimeError):
                     _warn(u"Could not build review intersect.")
                     _safe_delete(review_fc)
                     review_fc = None
 
-            # Mask output FC
+            # Mask output FC (persisted into out_ws)
             out_mask_fc = None
             if create_maskout and mask_count > 0:
                 out_mask_fc = _normalize_output_path(out_ws, out_clean_name + "_Mask")
@@ -1367,6 +1735,7 @@ class SafeContourCleaner(object):
                 out_removed_fc = None
                 if create_removed and final_mask_count > 0:
                     tmp_removed = arcpy.CreateUniqueName(_unique("removed_preview"), scratch)
+                    intermediates.append(tmp_removed)
                     try:
                         arcpy.analysis.Intersect(
                             [eligible_fc, final_mask_fc], tmp_removed,
@@ -1376,8 +1745,8 @@ class SafeContourCleaner(object):
                         if arcpy.Exists(out_removed_fc):
                             arcpy.management.Delete(out_removed_fc)
                         arcpy.management.CopyFeatures(tmp_removed, out_removed_fc)
-                    finally:
-                        _safe_delete(tmp_removed)
+                    except (arcpy.ExecuteError, RuntimeError):
+                        _warn(u"Dry-run Intersect for removed preview failed.")
 
                 out_review_fc = None
                 if review_fc and arcpy.Exists(review_fc):
@@ -1398,13 +1767,15 @@ class SafeContourCleaner(object):
             if removal_method == "Segment Erase (recommended)":
                 try:
                     prod = arcpy.ProductInfo()
-                except Exception:
+                except (RuntimeError, arcpy.ExecuteError):
                     prod = None
                 if prod != "ArcInfo":
-                    _warn(u"Advanced license not detected (Erase may fail). Falling back to 'Delete Whole Features'.")
+                    _warn(u"Advanced license not detected (Erase may fail). "
+                          u"Falling back to 'Delete Whole Features'.")
                     removal_method = "Delete Whole Features"
 
             cleaned_eligible_fc = arcpy.CreateUniqueName(_unique("eligible_clean"), scratch)
+            intermediates.append(cleaned_eligible_fc)
             removed_fc = None
 
             if final_mask_count == 0:
@@ -1413,13 +1784,27 @@ class SafeContourCleaner(object):
             else:
                 if removal_method == "Segment Erase (recommended)":
                     _msg(u"Cleaning: Segment Erase...")
-                    arcpy.analysis.Erase(eligible_fc, final_mask_fc, cleaned_eligible_fc)
-                    if create_removed:
+                    try:
+                        arcpy.analysis.Erase(
+                            eligible_fc, final_mask_fc, cleaned_eligible_fc)
+                    except (arcpy.ExecuteError, RuntimeError):
+                        _warn(u"Erase failed; falling back to Delete Whole Features.")
+                        _safe_delete(cleaned_eligible_fc)
+                        # Fall through to whole-feature path
+                        removal_method = "Delete Whole Features"
+                    if create_removed and removal_method == "Segment Erase (recommended)":
                         removed_fc = arcpy.CreateUniqueName(_unique("removed"), scratch)
-                        arcpy.analysis.Intersect(
-                            [eligible_fc, final_mask_fc], removed_fc,
-                            output_type="LINE")
-                else:
+                        intermediates.append(removed_fc)
+                        try:
+                            arcpy.analysis.Intersect(
+                                [eligible_fc, final_mask_fc], removed_fc,
+                                output_type="LINE")
+                        except (arcpy.ExecuteError, RuntimeError):
+                            _warn(u"Could not build removed-segments layer.")
+                            _safe_delete(removed_fc)
+                            removed_fc = None
+
+                if removal_method == "Delete Whole Features":
                     _msg(u"Cleaning: Delete Whole Features...")
                     lyr_elig = _unique("eligible_lyr")
                     try:
@@ -1428,6 +1813,7 @@ class SafeContourCleaner(object):
                             lyr_elig, "INTERSECT", final_mask_fc)
                         if create_removed:
                             removed_fc = arcpy.CreateUniqueName(_unique("removed"), scratch)
+                            intermediates.append(removed_fc)
                             arcpy.management.CopyFeatures(lyr_elig, removed_fc)
                         arcpy.management.SelectLayerByAttribute(
                             lyr_elig, "SWITCH_SELECTION")
@@ -1435,19 +1821,21 @@ class SafeContourCleaner(object):
                     finally:
                         try:
                             arcpy.management.Delete(lyr_elig)
-                        except Exception:
+                        except (arcpy.ExecuteError, RuntimeError):
                             pass
 
             # Optional: tiny leftover segments cleanup
             if min_seg_length and min_seg_length > 0:
                 _msg(u"Removing tiny leftover segments < {0} ...".format(min_seg_length))
                 cleaned2 = arcpy.CreateUniqueName(_unique("eligible_clean2"), scratch)
+                intermediates.append(cleaned2)
                 self._remove_small_segments(cleaned_eligible_fc, min_seg_length, cleaned2)
                 _safe_delete(cleaned_eligible_fc)
                 cleaned_eligible_fc = cleaned2
 
             # Merge cleaned + protected -> final output
             merged_out = arcpy.CreateUniqueName(_unique("merged_out"), scratch)
+            intermediates.append(merged_out)
             _msg(u"Merging cleaned eligible + untouched protected contours...")
             arcpy.management.Merge([cleaned_eligible_fc, noneligible_fc], merged_out)
 
@@ -1455,7 +1843,6 @@ class SafeContourCleaner(object):
             if arcpy.Exists(out_clean_fc):
                 arcpy.management.Delete(out_clean_fc)
             arcpy.management.CopyFeatures(merged_out, out_clean_fc)
-            _safe_delete(merged_out)
 
             out_removed_fc = None
             if create_removed and removed_fc and arcpy.Exists(removed_fc):
@@ -1487,17 +1874,13 @@ class SafeContourCleaner(object):
                         dense_threshold, min_neighbors, safe_mu,
                         aoi_mode, mask_mode, removal_method,
                         min_seg_length, removed_len_approx,
-                        out_clean_fc, out_removed_fc, out_review_fc, out_mask_fc)
-                except Exception:
+                        out_clean_fc, out_removed_fc, out_review_fc, out_mask_fc,
+                        full_map_fallback_used, sliver_count)
+                except (IOError, OSError):
+                    # OSError must propagate per MASTER RULE 1; re-raise.
+                    raise
+                except (arcpy.ExecuteError, RuntimeError):
                     _warn(u"Failed to write CSV report. {0}".format(traceback.format_exc()))
-
-            # Cleanup scratch intermediates
-            for p in (cleaned_eligible_fc, eligible_fc, noneligible_fc,
-                      removed_fc, mask_fc,
-                      final_mask_fc if final_mask_fc != mask_fc else None,
-                      review_fc, safe_zone_fc, working_all,
-                      merged_fc if merged_fc != working_all else None):
-                _safe_delete(p)
 
             if add_to_map:
                 _add_layers_to_map([out_clean_fc, out_removed_fc, out_review_fc, out_mask_fc])
@@ -1506,6 +1889,17 @@ class SafeContourCleaner(object):
             if report_path:
                 _msg(u"Report: {0}".format(report_path))
 
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
             _err(traceback.format_exc())
             raise
+        # MASTER RULE 1: MemoryError and OSError are NOT caught here. They
+        # propagate up and crash loudly so ArcMap's 32-bit RAM ceiling is
+        # never silently swallowed.
+        finally:
+            # MASTER RULE 6: explicit Delete for every intermediate, plus the
+            # final in_memory flush.
+            for p in intermediates:
+                _safe_delete(p)
+            _flush_in_memory()
+            gc.collect()
+            _restore_gp_env(env_snap)
