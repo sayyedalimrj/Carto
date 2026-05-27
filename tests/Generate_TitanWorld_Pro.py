@@ -585,6 +585,7 @@ def build_stage1_terrain(gdb: str) -> None:
                     cls = "FOOTHILL"
                 cur.insertRow([make_point(x, y), pid, z, s, cls])
                 pid += 1
+        del cur  # Force release of GDB edit lock
 
     log(f"  Generating contours from elevation field "
         f"(interval = {CONTOUR_INTERVAL:.0f} m)")
@@ -630,6 +631,7 @@ def build_stage1_terrain(gdb: str) -> None:
                 ])
                 cid += 1
         log(f"  Inserted {cid - 1} contour features across {len(levels)} levels")
+        del cur  # Force release of GDB edit lock
 
 
 
@@ -820,6 +822,7 @@ def build_stage2_hydrology(gdb: str) -> None:
                 # Canals also act as "rivers" for road bridge alignment.
                 paths.append(coords)
                 canal_count += 1
+        del cur  # Force release of GDB edit lock
 
     log(f"  Inserted {did} drainage / {riv_id} River_L / {sea_id} "
         f"Seasonal_River_L / {abr_id} Abreez / {canal_count} Canal features")
@@ -1161,6 +1164,7 @@ def build_stage3_roads(gdb: str) -> None:
                 make_polyline(coords), rid, "LOCAL", "COLLINEAR_OVERLAP",
             ])
             rid += 1
+        del cur  # Force release of GDB edit lock
 
     log(f"  Inserted {rid} aggregate Roads features ("
         f"{len(primaries)} primary, "
@@ -1205,6 +1209,7 @@ def build_stage3_roads(gdb: str) -> None:
                 ROAD_PATHS.append((coords, "FREEWAY"))
                 crossings_for_layer.append((coords, "FREEWAY"))
             fwy_id += 1
+        del fwy  # Force release of GDB edit lock
 
     with arcpy.da.InsertCursor(
             highway_fc, ["SHAPE@", "HwyID", "Name", "HasTrueCurve"]) as hwy:
@@ -1245,6 +1250,7 @@ def build_stage3_roads(gdb: str) -> None:
                 hwy_id += 1
             except Exception:
                 pass
+        del hwy  # Force release of GDB edit lock
 
     # Parkway: a dense-vertex switchback up the foothill of Mt. Titan.
     with arcpy.da.InsertCursor(
@@ -1302,6 +1308,7 @@ def build_stage3_roads(gdb: str) -> None:
                 ROAD_PATHS.append((coords, "PARKWAY"))
                 crossings_for_layer.append((coords, "PARKWAY"))
                 pkwy_id += 1
+        del pkwy  # Force release of GDB edit lock
 
     # Asphalt_Road: the local plain grid + secondary connectors.
     with arcpy.da.InsertCursor(
@@ -1318,6 +1325,7 @@ def build_stage3_roads(gdb: str) -> None:
             ])
             crossings_for_layer.append((coords, "ASPHALT_ROAD"))
             asph_id += 1
+        del asph  # Force release of GDB edit lock
 
     # Gravel: T-stubs are a great natural fit for unpaved stubs, plus a
     # handful of additional rural tracks meandering off the plain edges.
@@ -1349,6 +1357,7 @@ def build_stage3_roads(gdb: str) -> None:
             ])
             crossings_for_layer.append((coords, "GRAVEL"))
             grv_id += 1
+        del grv  # Force release of GDB edit lock
 
     log(f"  Named layers inserted: "
         f"Freeway={fwy_id} Highway={hwy_id} Parkway={pkwy_id} "
@@ -1399,6 +1408,7 @@ def build_stage3_roads(gdb: str) -> None:
                 else:
                     cp.insertRow([make_point(ix, iy), cid, rcls, ri])
                     cid += 1
+        del bp, cp  # Force release of GDB edit locks
 
     log(f"  Inserted Bridge_P={bid}, Culvert_Pnt={cid} at river crossings")
 
@@ -1593,6 +1603,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
             ])
             bld_id += 1
             inserted += 1
+        del cur  # Force release of GDB edit lock
 
     log(f"  Inserted {inserted:,} along-road buildings after "
         f"{attempts:,} attempts")
@@ -1644,6 +1655,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
                 pipe_id += 1
             except Exception:
                 pass
+        del cur  # Force release of GDB edit lock
     log(f"  Inserted {pipe_id} Gas_Pipe_L features (tangent + true-curve)")
 
     # ---- Power_Line_L -- zig-zag crossing True-Curve highways at 5-10 deg
@@ -1708,6 +1720,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
                 500, line_id, "ACUTE_ZIGZAG", cross_deg,
             ])
             line_id += 1
+        del cur  # Force release of GDB edit lock
     log(f"  Inserted {line_id} Power_Line_L features "
         f"({n_conflicts} acute-angle conflict zones)")
 
@@ -1742,6 +1755,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
                 hwy_id, "INTERCHANGE_RAMP", 1,
             ])
             hwy_id += 1
+        del cur  # Force release of GDB edit lock
 
     # ---- Arc-band buildings (10k+ within 2-15 m of the test arc) --------
     log("  Adding arc-band buildings around the test arc "
@@ -1768,6 +1782,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
                 random.uniform(3.0, 18.0),
             ])
             bld_id += 1
+        del cur  # Force release of GDB edit lock
 
     # ---- Trees: along arc band + foothills -------------------------------
     log("  Inserting Trees (arc band + foothills 1100-1400 m)")
@@ -1791,6 +1806,7 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
             if 1100 < z < 1400:
                 cur.insertRow([make_point(x, y), tid, random.choice(species)])
                 tid += 1
+        del cur  # Force release of GDB edit lock
     log(f"  Inserted {tid} trees")
 
 
@@ -1937,6 +1953,7 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
             ambient += 1
         log(f"  Inserted {ambient} ambient steep-slope springs after "
             f"{attempts} attempts")
+        del cur  # Force release of GDB edit lock
 
     # --- Map_Frame --------------------------------------------------------
     frame_fc = create_fc(
@@ -1947,6 +1964,7 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
                   (X_MAX, Y_MAX), (X_MIN, Y_MAX)]
     with arcpy.da.InsertCursor(frame_fc, ["SHAPE@", "FrameName"]) as cur:
         cur.insertRow([make_polygon([frame_ring]), "TITAN_FRAME"])
+        del cur  # Force release of GDB edit lock
 
     # --- Custom_AOI: sawtooth boundary biting into mountain contours -----
     aoi_fc = create_fc(
@@ -1977,6 +1995,7 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
             "TITAN_AOI",
             "Sawtooth boundary on Mt. Titan flank -> <0.1 m clip slivers",
         ])
+        del cur  # Force release of GDB edit lock
 
     # --- Label_Candidate_Boxes (Plugin 03/04 AABB stress) ----------------
     label_fc = create_fc(
@@ -2082,6 +2101,7 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
                 random.randint(7, 9),  # apex labels are high priority
                 "VAPEX",
             ])
+        del cur  # Force release of GDB edit lock
 
 
 # ===========================================================================
@@ -2148,6 +2168,7 @@ def build_p07_index_grid(gdb: str) -> None:
                 f"Sheet_R{j:02d}C{i:02d}",
             ])
             sheet_id += 1
+        del cur  # Force release of GDB edit lock
 
     grid_fc = create_fc(
         "Index_Grid", "POLYGON",
@@ -2171,6 +2192,7 @@ def build_p07_index_grid(gdb: str) -> None:
                 cell_id, i, j, f"R{j:04d}C{i:04d}",
             ])
             cell_id += 1
+        del cur  # Force release of GDB edit lock
 
     grid_gcs_fc = create_fc(
         "Index_Grid_GCS", "POLYGON",
@@ -2196,6 +2218,7 @@ def build_p07_index_grid(gdb: str) -> None:
                 cid, i, j,
             ])
             cid += 1
+        del cur  # Force release of GDB edit lock
 
     huge_fc = create_fc(
         "Huge_Grid_Extent", "POLYGON",
@@ -2218,6 +2241,7 @@ def build_p07_index_grid(gdb: str) -> None:
             HUGE_GRID_TICKS, HUGE_GRID_TICKS,
             "Drives MAX_TICKS_PER_AXIS guard in Plugin07",
         ])
+        del cur  # Force release of GDB edit lock
 
 
 # ===========================================================================
