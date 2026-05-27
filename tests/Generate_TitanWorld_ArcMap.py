@@ -1274,30 +1274,46 @@ def build_stage3_roads(gdb, sr, river_polylines_coords,
     )
     bridge_classes = ("Freeway", "Highway", "Parkway")
     nb = nc = 0
+    # File geodatabases do not allow two InsertCursors to be open
+    # concurrently against the same workspace (the first cursor opens
+    # an implicit transaction and the second raises
+    # "workspace already in transaction mode").  We therefore buffer
+    # bridges and culverts into in-memory lists in a single dispatch
+    # pass, then write each feature class with its own cursor in its
+    # own `with` block.
+    bridge_rows = []
+    culvert_rows = []
+    for (bx, by, ridx, rdir, klass) in bridge_points:
+        rdx, rdy = rdir
+        if klass in bridge_classes:
+            bridge_rows.append([
+                make_point(bx, by, sr), nb, klass, ridx,
+                rdx, rdy, "Road_River_Crossing",
+            ])
+            nb += 1
+        else:
+            culvert_rows.append([
+                make_point(bx, by, sr), nc, klass, ridx,
+                rdx, rdy, "Road_River_Crossing",
+            ])
+            nc += 1
+
     with arcpy.da.InsertCursor(
             bridge_fc,
             ["SHAPE@", "BridgeID", "RoadClass", "RiverIdx",
-             "RiverDirX", "RiverDirY", "EdgeCase"]) as bcur, \
-         arcpy.da.InsertCursor(
+             "RiverDirX", "RiverDirY", "EdgeCase"]) as bcur:
+        for row in bridge_rows:
+            bcur.insertRow(row)
+    del bcur
+
+    with arcpy.da.InsertCursor(
             culvert_fc,
             ["SHAPE@", "CulvertID", "RoadClass", "RiverIdx",
              "RiverDirX", "RiverDirY", "EdgeCase"]) as ccur:
-        for (bx, by, ridx, rdir, klass) in bridge_points:
-            rdx, rdy = rdir
-            if klass in bridge_classes:
-                bcur.insertRow([
-                    make_point(bx, by, sr), nb, klass, ridx,
-                    rdx, rdy, "Road_River_Crossing",
-                ])
-                nb += 1
-            else:
-                ccur.insertRow([
-                    make_point(bx, by, sr), nc, klass, ridx,
-                    rdx, rdy, "Road_River_Crossing",
-                ])
-                nc += 1
-    del bcur
+        for row in culvert_rows:
+            ccur.insertRow(row)
     del ccur
+
     log("STAGE 3: Bridge_P = {0}, Culvert_Pnt = {1}".format(nb, nc))
     return roads_fc, trunk_endpoints, trunk_classes
 
