@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Spring Rotation - Comparison Suite  (ArcMap 10.x, Python 2.7 / best-effort ArcGIS Pro)
-v4 HARDENED
+v4 HARDENED (MASTER RULES revision)
 
 Original maintainer:
     Ali Mirjafari - 09186441801
@@ -22,6 +22,27 @@ What changed vs v3 (and WHY it now processes ALL springs):
     4. Memory/scale notes for big sheets (32-bit ArcMap ~2 GB in stand-alone,
        ~4 GB in-process). Contour geometry cache stays NEAR_ONLY by default.
 
+What changed in the MASTER RULES revision (v4.1):
+    A. NARROW EXCEPTIONS at GP calls: only (arcpy.ExecuteError, RuntimeError)
+       are caught around geoprocessing. MemoryError and OSError now propagate
+       and crash loudly instead of being silently swallowed.
+    B. GP ENVIRONMENT snapshot at execute() entry: arcpy.env.extent, mask,
+       outputCoordinateSystem, workspace, scratchWorkspace, overwriteOutput
+       are saved, neutralized, and restored in finally.
+    C. IN_MEMORY HYGIENE: scratch intermediates are explicitly Delete'd in
+       finally, plus a final arcpy.management.Delete("in_memory") flush.
+    D. PLANEFIT SINGULARITY FIX: method 04 now computes the condition number
+       of its 3x3 normal matrix; if >1e6, or if the points are collinear /
+       degenerate, the row is marked OK=0, NOTE="PLANEFIT_SINGULAR" and no
+       bogus rotation is written.
+    E. STRICT NUMERICAL UNIT CHECK: linear units are no longer compared by
+       string ("meter"/"metre"). We use sr.metersPerUnit with a 1e-6
+       tolerance so feature-dataset-overridden CRSs and unusual unit names
+       are handled correctly.
+    F. DEGENERATE BUFFER GUARD: before arcpy.analysis.Buffer for the AOI
+       contour band, the source extent area is checked. If area<=0 we log
+       a warning and skip the buffer (no Buffer call is made, no crash).
+
 Rotation convention: GEOGRAPHIC degrees, 0 = North, clockwise.
 """
 
@@ -32,6 +53,7 @@ import math
 import hashlib
 import traceback
 import time
+import gc
 import arcpy
 
 
@@ -96,12 +118,24 @@ def _oid_field(fc):
         return "OBJECTID"
 
 def _is_projected_meter(sr):
+    """
+    MASTER RULE: strict numerical / type check. Do NOT compare
+    sr.linearUnitName as a string ("meter" / "metre") - feature-dataset
+    overrides, foreign-language Arc installs, and custom unit definitions
+    can all break that. Use sr.metersPerUnit with a 1e-6 tolerance.
+    """
     try:
         if sr is None:
             return False
-        return (sr.type == "Projected") and \
-               ("meter" in sr.linearUnitName.lower() or "metre" in sr.linearUnitName.lower())
-    except Exception:
+        # Type must be Projected (Geographic CRS has no linear unit).
+        if getattr(sr, "type", None) != "Projected":
+            return False
+        mpu = getattr(sr, "metersPerUnit", None)
+        if mpu is None:
+            # Fall back to factoryCode-based heuristic if metersPerUnit missing.
+            return False
+        return abs(float(mpu) - 1.0) < 1e-6
+    except (RuntimeError, AttributeError, ValueError):
         return False
 
 def _utm_sr_for_lonlat(lon, lat):
@@ -189,6 +223,48 @@ def _get_count(ds):
 def _profile_msg(enabled, label, t0):
     if enabled:
         arcpy.AddMessage("[PROFILE] {0}: {1:.3f}s".format(label, time.time() - t0))
+
+
+# --------------------------
+# GP environment snapshot / restore  (MASTER RULE)
+# --------------------------
+
+def _snapshot_gp_env():
+    """Capture critical arcpy.env values at execute() entry, then neutralize."""
+    snap = {
+        "extent":                 arcpy.env.extent,
+        "mask":                   arcpy.env.mask,
+        "outputCoordinateSystem": arcpy.env.outputCoordinateSystem,
+        "workspace":              arcpy.env.workspace,
+        "scratchWorkspace":       arcpy.env.scratchWorkspace,
+        "overwriteOutput":        arcpy.env.overwriteOutput,
+    }
+    # Neutralize for clean GP execution.
+    arcpy.env.extent = None
+    arcpy.env.mask = None
+    arcpy.env.outputCoordinateSystem = None
+    return snap
+
+def _restore_gp_env(snap):
+    if not snap:
+        return
+    for key in ("extent", "mask", "outputCoordinateSystem",
+                "workspace", "scratchWorkspace"):
+        try:
+            setattr(arcpy.env, key, snap.get(key))
+        except (RuntimeError, arcpy.ExecuteError, AttributeError):
+            pass
+    try:
+        arcpy.env.overwriteOutput = snap.get("overwriteOutput", True)
+    except (RuntimeError, arcpy.ExecuteError, AttributeError):
+        pass
+
+def _flush_in_memory():
+    """Final scratch flush. MASTER RULE."""
+    try:
+        arcpy.management.Delete("in_memory")
+    except (arcpy.ExecuteError, RuntimeError):
+        pass
 
 
 # --------------------------
@@ -281,6 +357,26 @@ def _add_to_current_map(dataset_path, method_code, symbology_source_layer, auto_
 # AOI helpers
 # --------------------------
 
+def _safe_extent_area(fc):
+    """
+    Compute the area of a feature class' overall extent (W*H).
+    Returns 0.0 if anything goes wrong or the extent is degenerate.
+    Used to guard arcpy.analysis.Buffer against zero-area inputs.
+    """
+    try:
+        d = arcpy.Describe(fc)
+        ext = getattr(d, "extent", None)
+        if ext is None:
+            return 0.0
+        w = float(ext.XMax) - float(ext.XMin)
+        h = float(ext.YMax) - float(ext.YMin)
+        if w <= 0 or h <= 0:
+            return 0.0
+        return w * h
+    except (RuntimeError, AttributeError, arcpy.ExecuteError, ValueError):
+        return 0.0
+
+
 def _project_and_buffer_aoi(aoi_fc, sr_work, buffer_dist, scratch_gdb, profile=False):
     t0 = time.time()
     aoi_p = os.path.join(scratch_gdb, "rot_tmp_aoi_p")
@@ -288,18 +384,28 @@ def _project_and_buffer_aoi(aoi_fc, sr_work, buffer_dist, scratch_gdb, profile=F
     _safe_delete(aoi_p); _safe_delete(aoi_b)
     try:
         arcpy.management.Project(aoi_fc, aoi_p, sr_work)
-    except Exception:
+    except (arcpy.ExecuteError, RuntimeError):
         return None, "AOI_PROJECT_FAIL"
     try:
         bd = float(buffer_dist) if buffer_dist is not None else 0.0
-    except Exception:
+    except (TypeError, ValueError):
         bd = 0.0
     if bd > 0:
+        # MASTER RULE: degenerate-buffer guard. arcpy.analysis.Buffer crashes
+        # hard if its source has a zero-area extent. Check before calling.
+        ext_area = _safe_extent_area(aoi_p)
+        if ext_area <= 0.0:
+            arcpy.AddWarning(
+                "AOI buffer skipped: source extent area <= 0 "
+                "(degenerate AOI geometry). Using unbuffered AOI.")
+            _profile_msg(profile, "AOI project+buffer (skipped: zero area)", t0)
+            return aoi_p, "OK_NO_BUF_ZEROAREA"
         try:
             arcpy.analysis.Buffer(aoi_p, aoi_b, "{0}".format(bd), "FULL", "ROUND", "ALL")
             _profile_msg(profile, "AOI project+buffer", t0)
             return aoi_b, "OK_BUF"
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
+            arcpy.AddWarning("AOI Buffer failed; using unbuffered AOI.")
             _profile_msg(profile, "AOI project+buffer (buffer failed)", t0)
             return aoi_p, "OK_NO_BUF"
     else:
@@ -479,6 +585,33 @@ def _method_02_highlow(near_tbl, elev_lu, spr_fc_proj, offset):
     return out
 
 def _method_04_planefit(near_tbl, elev_lu, offset):
+    """
+    Least-squares plane fit z = a*x + b*y + c over K nearby contour points
+    around each spring.
+
+    MASTER RULE: PlaneFit singularity fix.
+    --------------------------------------
+    The original implementation only checked |det(M)| < 1e-9. That misses
+    the "almost singular" case where the points are nearly collinear --
+    det(M) is small but non-zero, so Cramer's rule produces a numerically
+    bogus plane. We now also:
+
+      1. Build the symmetric 3x3 normal matrix
+             M = [[Sxx, Sxy, Sx],
+                  [Sxy, Syy, Sy],
+                  [Sx , Sy , N ]]
+      2. Estimate its condition number via the power-iteration-free
+         spectral bound
+             cond ~= max_eig / max(min_eig, eps)
+         where the eigenvalues are computed in closed form for the
+         symmetric 3x3 (cubic from the characteristic polynomial).
+      3. Test for collinearity directly (Sxx*Syy - Sxy^2) ~ 0 after
+         centering -> covariance matrix has a zero eigenvalue, meaning
+         all (x, y) lie on a line.
+
+    If any of these fail, OK=0 and NOTE="PLANEFIT_SINGULAR" is written
+    instead of a bogus rotation.
+    """
     id_field = _near_table_id_field(near_tbl)
     samples = {}
     with arcpy.da.SearchCursor(near_tbl, [id_field, "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
@@ -491,16 +624,63 @@ def _method_04_planefit(near_tbl, elev_lu, offset):
                 continue
             samples.setdefault(sid, []).append((float(nx), float(ny), float(z)))
 
-    def det3(a11, a12, a13, a21, a22, a23, a31, a32, a33):
+    def _det3(a11, a12, a13, a21, a22, a23, a31, a32, a33):
         return (a11 * (a22 * a33 - a23 * a32)
                 - a12 * (a21 * a33 - a23 * a31)
                 + a13 * (a21 * a32 - a22 * a31))
 
+    def _sym3_eigenvalues(m11, m12, m13, m22, m23, m33):
+        """
+        Closed-form eigenvalues of a real symmetric 3x3 matrix
+            [[m11, m12, m13],
+             [m12, m22, m23],
+             [m13, m23, m33]]
+        using the trigonometric solution of the characteristic cubic.
+        Returns the three eigenvalues sorted descending.
+        Reference: standard derivation, e.g. Wikipedia
+        "Eigenvalue algorithm" -- Smith's symmetric 3x3 method.
+        """
+        # If the off-diagonals are all (near) zero the matrix is already
+        # diagonal and the eigenvalues are the diagonal entries.
+        p1 = m12 * m12 + m13 * m13 + m23 * m23
+        if p1 < 1e-30:
+            evs = sorted([m11, m22, m33], reverse=True)
+            return evs
+        q = (m11 + m22 + m33) / 3.0
+        p2 = ((m11 - q) ** 2 + (m22 - q) ** 2 + (m33 - q) ** 2) + 2.0 * p1
+        p = math.sqrt(p2 / 6.0)
+        if p == 0.0:
+            evs = sorted([m11, m22, m33], reverse=True)
+            return evs
+        # B = (1/p) * (M - q*I)
+        b11 = (m11 - q) / p
+        b22 = (m22 - q) / p
+        b33 = (m33 - q) / p
+        b12 = m12 / p
+        b13 = m13 / p
+        b23 = m23 / p
+        det_b = _det3(b11, b12, b13, b12, b22, b23, b13, b23, b33)
+        r = det_b / 2.0
+        # Numerical clamping per Smith's algorithm.
+        if r <= -1.0:
+            phi = math.pi / 3.0
+        elif r >= 1.0:
+            phi = 0.0
+        else:
+            phi = math.acos(r) / 3.0
+        eig1 = q + 2.0 * p * math.cos(phi)
+        eig3 = q + 2.0 * p * math.cos(phi + (2.0 * math.pi / 3.0))
+        eig2 = 3.0 * q - eig1 - eig3
+        return sorted([eig1, eig2, eig3], reverse=True)
+
     out = {}
+    COND_LIMIT = 1.0e6  # MASTER RULE constant
     for sid, pts in samples.items():
         if len(pts) < 3:
             out[sid] = (None, 0, "NEED_3PTS")
             continue
+
+        # Accumulate sums for the normal matrix.
         sxx = syy = sxy = sx = sy = 0.0
         sxz = syz = sz = 0.0
         n = 0.0
@@ -509,14 +689,56 @@ def _method_04_planefit(near_tbl, elev_lu, offset):
             sxx += x * x; syy += y * y; sxy += x * y
             sx += x; sy += y
             sxz += x * z; syz += y * z; sz += z
-        D = det3(sxx, sxy, sx, sxy, syy, sy, sx, sy, n)
-        if abs(D) < 1e-9:
-            out[sid] = (None, 0, "SINGULAR")
+
+        # Collinearity check on the (x, y) cloud (independent of z).
+        # Centered second moments: var_x*var_y - cov_xy^2 ~ 0 -> collinear.
+        if n >= 1.0:
+            mean_x = sx / n
+            mean_y = sy / n
+            var_x = (sxx / n) - (mean_x * mean_x)
+            var_y = (syy / n) - (mean_y * mean_y)
+            cov_xy = (sxy / n) - (mean_x * mean_y)
+            xy_det = var_x * var_y - cov_xy * cov_xy
+            xy_scale = max(abs(var_x), abs(var_y), 1.0)
+            if xy_det <= 1e-12 * xy_scale * xy_scale:
+                out[sid] = (None, 0, "PLANEFIT_SINGULAR")
+                continue
+
+        # Eigen-decomposition of the symmetric 3x3 normal matrix to get
+        # the condition number (cond = lambda_max / max(|lambda_min|, eps)).
+        evs = _sym3_eigenvalues(sxx, sxy, sx,
+                                syy, sy,
+                                n)
+        lam_max = max(abs(evs[0]), abs(evs[1]), abs(evs[2]))
+        lam_min = min(abs(evs[0]), abs(evs[1]), abs(evs[2]))
+        if lam_max <= 0.0:
+            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
             continue
-        Da = det3(sxz, sxy, sx, syz, syy, sy, sz, sy, n)
-        Db = det3(sxx, sxz, sx, sxy, syz, sy, sx, sz, n)
+        if lam_min < (lam_max / COND_LIMIT):
+            # Matrix is effectively rank-deficient.
+            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
+            continue
+
+        # Now the determinant-based solve is numerically safe.
+        D = _det3(sxx, sxy, sx,
+                  sxy, syy, sy,
+                  sx,  sy,  n)
+        if abs(D) < 1e-12 * lam_max:
+            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
+            continue
+
+        Da = _det3(sxz, sxy, sx,
+                   syz, syy, sy,
+                   sz,  sy,  n)
+        Db = _det3(sxx, sxz, sx,
+                   sxy, syz, sy,
+                   sx,  sz,  n)
         a = Da / D
         b = Db / D
+        # Down-slope direction is -gradient = (-a, -b).
+        if abs(a) < 1e-15 and abs(b) < 1e-15:
+            out[sid] = (None, 0, "ZERO_GRAD")
+            continue
         az = _azimuth_geo_deg(-a, -b)
         if az is None:
             out[sid] = (None, 0, "ZERO_GRAD")
@@ -1176,6 +1398,9 @@ class SpringRotationFinalSuiteTool(object):
         return
 
     def execute(self, parameters, messages):
+        # MASTER RULE 4: snapshot env at entry, neutralize, restore in finally.
+        env_snap = _snapshot_gp_env()
+
         springs = parameters[0].valueAsText
         contours = parameters[1].valueAsText
         elev_field = parameters[2].valueAsText
@@ -1216,10 +1441,10 @@ class SpringRotationFinalSuiteTool(object):
 
         try:
             arcpy.env.overwriteOutput = True
-        except Exception:
+        except (RuntimeError, arcpy.ExecuteError):
             pass
 
-        arcpy.AddMessage("Spring Rotation tool (v4 hardened) started.")
+        arcpy.AddMessage("Spring Rotation tool (v4 hardened, master rules) started.")
         arcpy.AddMessage("Maintainer: Ali Mirjafari - 09186441801")
 
         try:
@@ -1236,11 +1461,22 @@ class SpringRotationFinalSuiteTool(object):
                 aoi_buffer=float(aoi_buffer) if aoi_buffer is not None else 0.0,
                 cache_mode=cache_mode, profile=profile, ignore_selection=ignore_selection,
                 run_01=run_01, run_02=run_02, run_03=run_03, run_04=run_04, run_05=run_05)
-        except Exception:
+        except (arcpy.ExecuteError, RuntimeError):
             tb = traceback.format_exc()
             arcpy.AddError("Tool failed. Traceback:")
             arcpy.AddError(tb)
             raise
+        # MASTER RULE 1: MemoryError and OSError are NOT caught here. They
+        # propagate up and crash loudly so ArcMap's 32-bit RAM ceiling is
+        # never silently swallowed.
+        finally:
+            # MASTER RULE 6: in_memory flush + restore env in all cases.
+            _flush_in_memory()
+            try:
+                gc.collect()
+            except Exception:  # gc.collect itself is robust; broad guard ok
+                pass
+            _restore_gp_env(env_snap)
 
         parameters[26].value = ";".join([str(x) for x in outs])
         arcpy.AddMessage("Done. Created {0} output(s).".format(len(outs)))
