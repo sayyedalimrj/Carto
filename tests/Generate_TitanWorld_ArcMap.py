@@ -486,6 +486,7 @@ def build_stage1_terrain(gdb, sr):
             else:
                 zone = "Hill"
             ec.insertRow([make_point(x, y, sr), i, z, s, zone])
+        del ec
 
     # ------------------------------------------------------------------
     # Contours via a marching-segments pass over a coarse grid
@@ -675,6 +676,7 @@ def build_stage1_terrain(gdb, sr):
         next_id += 1
         log("  Titan Ridge inserted (length ~{0:.1f} m, peak elev ~{1:.0f} m)"
             .format(titan_polyline.length, peak_elev))
+        del cc
 
     log("STAGE 1: contours total = {0}, V-apexes captured = {1}"
         .format(next_id, len(contour_v_apexes)))
@@ -884,6 +886,7 @@ def build_stage2_hydrology(gdb, sr):
             sample_pools(coords)
             n_done += 1
 
+    del rc
     log("STAGE 2: complete. hydrology features = {0}".format(n_done))
     return rivers_fc, river_polylines_coords, \
         river_vertex_pool, river_segment_pool
@@ -1238,6 +1241,7 @@ def build_stage3_roads(gdb, sr, river_polylines_coords,
             ])
             next_road_id += 1
 
+    del rc
     log("STAGE 3: roads = {0}, captured {1} bridge crossings"
         .format(next_road_id, len(bridge_points)))
 
@@ -1292,6 +1296,8 @@ def build_stage3_roads(gdb, sr, river_polylines_coords,
                     rdx, rdy, "Road_River_Crossing",
                 ])
                 nc += 1
+    del bcur
+    del ccur
     log("STAGE 3: Bridge_P = {0}, Culvert_Pnt = {1}".format(nb, nc))
     return roads_fc, trunk_endpoints, trunk_classes
 
@@ -1545,6 +1551,7 @@ def build_stage4_megacity(gdb, sr, roads_fc, trunk_endpoints,
                 log("    cluster buildings: {0}/{1}"
                     .format(n_cluster, N_BUILDINGS_CLUSTER))
 
+    del bc
     log("STAGE 4: buildings = {0} (background + cluster)"
         .format(next_bld_id))
 
@@ -1632,6 +1639,7 @@ def build_stage4_megacity(gdb, sr, roads_fc, trunk_endpoints,
                 "Background",
             ])
             next_pipe_id += 1
+    del gc
     log("  Gas_Pipe_L total: {0}".format(next_pipe_id))
 
     # ------------------------------------------------------------------
@@ -1763,6 +1771,7 @@ def build_stage4_megacity(gdb, sr, roads_fc, trunk_endpoints,
                 "Background",
             ])
             next_line_id += 1
+    del pc
     log("  Power_Line_L total: {0}".format(next_line_id))
 
     # ------------------------------------------------------------------
@@ -1819,6 +1828,7 @@ def build_stage4_megacity(gdb, sr, roads_fc, trunk_endpoints,
                 ck, edge,
             ])
             next_lab += 1
+    del lc
     log("  label boxes: {0} ({1} hotspots used)"
         .format(next_lab, len(hotspots)))
 
@@ -2001,6 +2011,7 @@ def build_stage5_anomalies_and_edges(gdb, sr, contours_fc):
             next_spring, 0.2, "Isolated",
         ])
         next_spring += 1
+    del sc
     log("STAGE 5: springs total = {0}".format(next_spring))
 
     # ------------------------------------------------------------------
@@ -2024,6 +2035,7 @@ def build_stage5_anomalies_and_edges(gdb, sr, contours_fc):
     with arcpy.da.InsertCursor(
             frame_fc, ["SHAPE@", "FrameID", "Name"]) as fc:
         fc.insertRow([make_polygon(frame_coords, sr), 0, "Master Frame"])
+    del fc
 
     # ------------------------------------------------------------------
     # Custom_AOI: sawtooth edge biting into mountainous contours.
@@ -2097,6 +2109,7 @@ def build_stage5_anomalies_and_edges(gdb, sr, contours_fc):
             0, "Sawtooth AOI (plain -> NW peak)",
             "Sawtooth_Slivers",
         ])
+    del ac
     log("  Custom_AOI sawtooth vertices ~{0}".format(len(aoi_pts)))
 
 
@@ -2148,6 +2161,7 @@ def build_stage5_grids(gdb, projected_sr, geographic_sr):
                     "Index_Sheet",
                 ])
                 next_id += 1
+    del gc
     log("  Index_Grid sheets emitted: {0} (target 16..24)"
         .format(next_id))
     log("  P07: GCS_Grid (WGS84, GCS-warning trigger)...")
@@ -2181,6 +2195,7 @@ def build_stage5_grids(gdb, projected_sr, geographic_sr):
                 ])
                 next_gcs += 1
 
+    del gc
     log("  P07: HUGE_Grid_Sparse (MAX_TICKS_PER_AXIS trigger)...")
     huge_fc = create_fc(
         gdb, "HUGE_Grid_Sparse", "POLYGON", projected_sr,
@@ -2240,6 +2255,7 @@ def build_stage5_grids(gdb, projected_sr, geographic_sr):
             if next_huge % 25000 == 0:
                 log("    HUGE sparse cells: {0}/{1}"
                     .format(next_huge, HUGE_GRID_SAMPLE_LIMIT))
+    del gc
     log("  P07 complete: index={0} gcs={1} huge={2}"
         .format(next_id, next_gcs, next_huge))
 
