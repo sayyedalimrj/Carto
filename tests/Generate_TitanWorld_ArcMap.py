@@ -3,45 +3,60 @@
 Generate_TitanWorld_ArcMap.py
 =============================
 
-Procedural stress-test generator for the Carto ArcMap (Python 2.7 / arcpy 10.x)
-plugin suite.
+TITAN WORLD 2.0 - Topologically Dependent Procedural Generator
+(ArcMap 10.x / Python 2.7 / arcpy)
 
-This script creates a single, very large File Geodatabase named
-``TitanWorld_ArcMap.gdb`` populated with feature classes that exercise every
-cartographic edge case targeted by Plugin01..Plugin07:
+Unlike the v1 generator (which produced statistically dense but
+geographically nonsensical layers), this version is organized as a
+strict cartographic pipeline.  The same elevation oracle drives every
+downstream feature class, so the resulting world is internally
+consistent: rivers actually live in valleys, roads avoid cliffs,
+buildings cluster on the plain, and so on.
 
-    * P01 BridgeCulvert        -> Roads + Drainage with true crossings,
-                                  T-junctions, and collinear overlaps.
-    * P02 RoadDeconflict       -> Power_Lines, Gas_Pipes, Buildings with
-                                  pipe-under-road, acute angle crossings,
-                                  and a dense 1km building cluster.
-    * P03 ContourLabelOpt      -> Contours including a single half-million
-                                  vertex "Titan Ridge" fractal/spiral.
-    * P04 ElevationTextDecon   -> Label_Candidate_Boxes with heavy overlap.
-    * P05 SafeContourCleaner   -> Map_Frame and Custom_AOI with a sawtooth
-                                  edge designed to produce sub-decimeter
-                                  slivers when contours are clipped.
-    * P06 SpringRotation       -> Springs with five perfectly collinear
-                                  points (SVD singular fault line) and an
-                                  isolated spring far from any contour.
-    * P07 BatchGridBuilder     -> A projected Index_Grid plus a geographic
-                                  WGS84 grid (GCS warning trigger) and a
-                                  very large grid intended to trip the
-                                  MAX_TICKS_PER_AXIS safety cap.
+Pipeline stages
+---------------
 
-The script is purposefully self-contained: only ``arcpy``, ``math``, ``os``,
-``sys``, ``time``, and ``random`` are used.  It is intended to be executed
-from inside an ArcMap 10.x Python 2.7 environment.  It is NOT meant to be
-imported.
+  STAGE 1  Terrain Foundation (the Oracle)
+           - get_elevation(x, y) compound-sine pseudo-Perlin field
+           - "Elevation_Points" sampled from that field
+           - "Contours" traced as polylines along iso-value bands
+           - "Titan Ridge": a 500k-vertex contour pinned to a designated
+             mountain peak (P03 stress)
+
+  STAGE 2  Hydrology
+           - "Drainage" rivers descend along the negative gradient of
+             the elevation field, naturally settling in valleys
+
+  STAGE 3  Infrastructure
+           - "Roads" are placed where slope is small (plain + valleys)
+           - Where roads must cross rivers, they are forced through
+             near-perpendicular crossings (bridges / culverts)
+           - Edge cases: T-junction stubs at river vertices and short
+             collinear overlaps for P01
+
+  STAGE 4  Megacity + Utilities
+           - "Buildings" cluster on the central flat plain, attached to
+             roads, never on rivers or roads (P02 dense-cluster stress)
+           - "Gas_Pipes" run parallel underneath roads
+           - "Power_Lines" parallel most of the way but cross some
+             roads at acute angles in dedicated zones (P02 stress)
+
+  STAGE 5  Geological Anomalies & Cartographic Edges
+           - "Springs" placed at the foot of mountains (elevation band)
+           - 5 perfectly collinear springs along a steep slope contour
+             (SVD singular trigger for P06)
+           - "Map_Frame" + "Custom_AOI" with sawtooth edge that bites
+             into mountainous contours -> sub-decimeter slivers for P05
+           - "Index_Grid", "GCS_Grid" (WGS84), "HUGE_Grid_Sparse" for P07
+
+The script is self-contained: only ``arcpy``, ``math``, ``os``,
+``sys``, ``time``, and ``random`` are used.
 
 Usage::
 
     C:\\Python27\\ArcGIS10.8\\python.exe Generate_TitanWorld_ArcMap.py [out_dir]
 
-If ``out_dir`` is omitted the script writes ``TitanWorld_ArcMap.gdb`` next to
-itself.
-
-Author: Carto / Titan World stress-test rig
+If ``out_dir`` is omitted the gdb is written next to the script.
 """
 
 import os
@@ -64,7 +79,6 @@ except ImportError:  # pragma: no cover - this script targets ArcMap only
 # Global configuration
 # ---------------------------------------------------------------------------
 
-# Deterministic chaos: same seed -> same Titan World.
 RANDOM_SEED = 20260527
 random.seed(RANDOM_SEED)
 
@@ -76,42 +90,71 @@ YMAX = 3920000.0
 WIDTH = XMAX - XMIN     # 20000 m
 HEIGHT = YMAX - YMIN    # 20000 m
 
-# Projected coordinate system: WGS 1984 UTM Zone 11N (WKID 32611).
+# Projected CS: WGS 1984 UTM Zone 11N (WKID 32611).  Geographic CS: WGS 84.
 PROJECTED_WKID = 32611
 GEOGRAPHIC_WKID = 4326
 
 GDB_NAME = "TitanWorld_ArcMap.gdb"
 
-# Feature counts (tuned for stress, not realism).
-N_ROADS = 6000              # individual road line features
-N_RIVERS = 3500             # individual drainage features
-N_TRUE_CROSSINGS_TARGET = 50000  # informational; emerges from network density
+# ----- Terrain (the Oracle) -----
+# Elevation range targeted: ~ 800 .. 2400 m.
+ELEV_BASE = 1500.0
+ELEV_AMPLITUDE = 800.0       # peak vertical scale per dominant octave
+ELEV_PLAIN_LEVEL = 1450.0    # the central plain elevation
+ELEV_PLAIN_BAND = 80.0       # +/- band considered "flat plain"
+ELEV_MOUNTAIN_FOOT = 1700.0  # spring band lower bound
+ELEV_MOUNTAIN_BAND = 200.0   # spring band width
+
+# Designated mountain peak centres (used for the Titan Ridge anchoring
+# and for elevation amplification).  Coordinates are normalized 0..1
+# inside the bbox.
+PEAKS_NORM = [
+    (0.18, 0.78, 1.00),  # NW peak (Titan Ridge anchor)
+    (0.85, 0.82, 0.80),  # NE peak
+    (0.82, 0.18, 0.85),  # SE peak
+    (0.15, 0.20, 0.75),  # SW peak
+]
+
+# Central plain (flat, plain elevation, hosts the megacity)
+PLAIN_CENTER_NORM = (0.50, 0.50)
+PLAIN_RADIUS_M = 4500.0      # plain "radius" for soft mask
+
+# ----- Layer counts -----
+N_ELEVATION_POINTS = 6000
+N_CONTOUR_LEVELS = 22                # number of distinct elevation bands
+N_CONTOURS_PER_LEVEL_MAX = 80        # cap per level to keep total bounded
+TITAN_RIDGE_VERTICES = 500000        # half-million-vertex stress feature
+
+N_RIVERS = 80                        # rivers traced via gradient descent
+N_ROAD_TRUNK_LINES = 40              # main trunks across plain+valleys
+N_ROAD_LOCAL_PER_TRUNK = 35          # local connectors hanging off trunks
+
 N_T_JUNCTIONS = 1500
 N_COLLINEAR_OVERLAPS = 400
 
-N_POWER_LINES = 1200
-N_GAS_PIPES = 1500
-N_BUILDINGS_BACKGROUND = 4000
-N_BUILDINGS_DENSE_CLUSTER = 10500   # along a single 1 km road segment
+N_BUILDINGS_CLUSTER = 10500          # tight cluster along city road
+N_BUILDINGS_BACKGROUND = 4000        # diffuse plain buildings
 
-N_CONTOURS_BACKGROUND = 1500
-TITAN_RIDGE_VERTICES = 500000        # half-million vertex single line
+N_GAS_PIPES_PARALLEL = 700           # parallel-under-road pipes
+N_GAS_PIPES_BACKGROUND = 800
+N_POWER_LINES_PARALLEL = 600
+N_POWER_LINES_ACUTE = 400            # dedicated acute-cross zone
+N_POWER_LINES_BACKGROUND = 200
+
 N_LABEL_BOXES = 12000
 
-N_AOI_SAWTOOTH_TEETH = 4000          # very jagged AOI edge
+N_AOI_SAWTOOTH_TEETH = 4000
 
-N_SPRINGS_RANDOM = 2500
-N_SPRINGS_FAULT_LINE = 5             # perfectly collinear -> SVD singular
+N_SPRINGS_RANDOM = 1800
+N_SPRINGS_FAULT_LINE = 5             # collinear (SVD singular)
 
 # Grid stress: large enough to trip a MAX_TICKS_PER_AXIS cap (~5000).
-HUGE_GRID_TICKS = 6000               # 6000 x 6000 cells nominally
-HUGE_GRID_SAMPLE_LIMIT = 250000      # actually emit at most this many cells
+HUGE_GRID_TICKS = 6000
+HUGE_GRID_SAMPLE_LIMIT = 250000
 
-# A modest projected grid that the grid builder should accept normally.
 NORMAL_GRID_ROWS = 40
 NORMAL_GRID_COLS = 40
 
-# A geographic (GCS) grid that should trigger the "GCS not recommended" warning.
 GCS_GRID_ROWS = 20
 GCS_GRID_COLS = 20
 
@@ -124,7 +167,6 @@ _T0 = time.time()
 
 
 def log(msg):
-    """Print a timestamped message to both stdout and arcpy messages."""
     elapsed = time.time() - _T0
     line = "[{0:8.2f}s] {1}".format(elapsed, msg)
     try:
@@ -135,7 +177,7 @@ def log(msg):
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers (pure Python, no numpy dependency required)
+# Utility helpers
 # ---------------------------------------------------------------------------
 
 def clamp(v, lo, hi):
@@ -147,16 +189,10 @@ def clamp(v, lo, hi):
 
 
 def jitter(amount):
-    """Symmetric random jitter in [-amount, +amount]."""
     return (random.random() * 2.0 - 1.0) * amount
 
 
-def point_in_bbox(x, y, pad=0.0):
-    return (XMIN + pad) <= x <= (XMAX - pad) and (YMIN + pad) <= y <= (YMAX - pad)
-
-
 def make_polyline(coords, sr):
-    """coords: list of (x, y); returns arcpy.Polyline."""
     arr = arcpy.Array([arcpy.Point(x, y) for (x, y) in coords])
     return arcpy.Polyline(arr, sr)
 
@@ -170,9 +206,116 @@ def make_point(x, y, sr):
     return arcpy.PointGeometry(arcpy.Point(x, y), sr)
 
 
+def in_bbox(x, y, pad=0.0):
+    return (XMIN + pad) <= x <= (XMAX - pad) and \
+           (YMIN + pad) <= y <= (YMAX - pad)
+
+
 # ---------------------------------------------------------------------------
-# Geodatabase / spatial reference setup
+# STAGE 1 - The Oracle: get_elevation(x, y) and helpers
 # ---------------------------------------------------------------------------
+#
+# Pseudo-Perlin: a sum of sine/cosine octaves (deterministic, no numpy
+# required).  We then add explicit Gaussian peaks at PEAKS_NORM and
+# subtract a Gaussian "plain" depression centred on PLAIN_CENTER_NORM
+# so the central area is genuinely flat.
+# ---------------------------------------------------------------------------
+
+
+def _norm_xy(x, y):
+    return (x - XMIN) / WIDTH, (y - YMIN) / HEIGHT
+
+
+def _gaussian2d(nx, ny, cx, cy, sigma):
+    dx = nx - cx
+    dy = ny - cy
+    return math.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma))
+
+
+def get_elevation(x, y):
+    """Deterministic compound elevation field over the bbox.
+
+    Returns elevation in meters.  Stable for the same (x, y) across
+    the whole script: every downstream stage reads from this oracle.
+    """
+    nx, ny = _norm_xy(x, y)
+
+    # Base rolling terrain (5 octaves of compound sin/cos).
+    base = (
+        0.50 * math.sin(nx * 6.2831853 * 1.3 + 0.7)
+        * math.cos(ny * 6.2831853 * 1.1 + 1.3)
+        + 0.30 * math.sin(nx * 6.2831853 * 2.7 + 2.1)
+        * math.cos(ny * 6.2831853 * 2.9 + 0.4)
+        + 0.15 * math.sin(nx * 6.2831853 * 5.3 + 4.2)
+        * math.cos(ny * 6.2831853 * 4.7 + 1.9)
+        + 0.07 * math.sin(nx * 6.2831853 * 11.1 + 0.3)
+        * math.cos(ny * 6.2831853 * 9.7 + 3.5)
+        + 0.03 * math.sin(nx * 6.2831853 * 21.7)
+        * math.cos(ny * 6.2831853 * 19.3)
+    )
+
+    # Mountain peaks: dominant Gaussian bumps above the base.
+    peak_sum = 0.0
+    for (pcx, pcy, pscale) in PEAKS_NORM:
+        peak_sum += pscale * _gaussian2d(nx, ny, pcx, pcy, 0.10)
+
+    # Central plain: a wide soft Gaussian "press-down" zeroing out the
+    # base oscillation in the middle so the plain is truly flat.
+    plain_g = _gaussian2d(nx, ny, PLAIN_CENTER_NORM[0],
+                          PLAIN_CENTER_NORM[1], 0.20)
+
+    # Combine.  Outside the plain, terrain ~= base + peaks.  Inside the
+    # plain, the base is damped towards zero so we get ~ELEV_PLAIN_LEVEL.
+    rough = base * (1.0 - 0.92 * plain_g)
+
+    elev = (
+        ELEV_BASE
+        + ELEV_AMPLITUDE * rough
+        + ELEV_AMPLITUDE * 1.20 * peak_sum
+        - 0.05 * ELEV_AMPLITUDE * plain_g  # gentle dip toward plain level
+    )
+    return elev
+
+
+def get_gradient(x, y, h=20.0):
+    """Numerical gradient of the elevation field via central differences."""
+    dz_dx = (get_elevation(x + h, y) - get_elevation(x - h, y)) / (2.0 * h)
+    dz_dy = (get_elevation(x, y + h) - get_elevation(x, y - h)) / (2.0 * h)
+    return dz_dx, dz_dy
+
+
+def get_slope(x, y, h=20.0):
+    dx, dy = get_gradient(x, y, h)
+    return math.hypot(dx, dy)
+
+
+def is_on_plain(x, y):
+    """True if (x, y) is inside the flat central plain band."""
+    e = get_elevation(x, y)
+    if abs(e - ELEV_PLAIN_LEVEL) > ELEV_PLAIN_BAND:
+        return False
+    nx, ny = _norm_xy(x, y)
+    plain_g = _gaussian2d(nx, ny, PLAIN_CENTER_NORM[0],
+                          PLAIN_CENTER_NORM[1], 0.20)
+    return plain_g > 0.45
+
+
+def is_on_mountain_foot(x, y):
+    """Spring-band membership."""
+    e = get_elevation(x, y)
+    return ELEV_MOUNTAIN_FOOT <= e <= (ELEV_MOUNTAIN_FOOT + ELEV_MOUNTAIN_BAND)
+
+
+def find_peak_world_xy(idx):
+    """Return the (x, y) of the idx-th designated peak in world coords."""
+    pcx, pcy, _ = PEAKS_NORM[idx]
+    return XMIN + pcx * WIDTH, YMIN + pcy * HEIGHT
+
+
+# ---------------------------------------------------------------------------
+# Geodatabase / SR setup
+# ---------------------------------------------------------------------------
+
 
 def resolve_output_dir():
     if len(sys.argv) >= 2 and sys.argv[1].strip():
@@ -201,7 +344,6 @@ def get_geographic_sr():
 
 
 def create_fc(gdb, name, geom_type, sr, fields):
-    """Create a feature class with a list of (name, type, length_or_none) fields."""
     arcpy.CreateFeatureclass_management(
         out_path=gdb,
         out_name=name,
@@ -219,127 +361,541 @@ def create_fc(gdb, name, geom_type, sr, fields):
 
 
 # ===========================================================================
-# P01 - Roads + Drainage (Bridges / Culverts edge cases)
+# STAGE 1 - Elevation_Points, Contours, Titan Ridge
 # ===========================================================================
 #
-# We build two interleaved networks:
+# Elevation_Points: Halton-ish quasirandom samples across the bbox with
+#   z = get_elevation(x, y).  Used by P03/P04 evaluation and for sanity
+#   checking the surface.
 #
-#   * Roads:    long, mostly E-W or N-S oriented polylines with random
-#               kinks.  Many of them are intentionally placed so they
-#               run perfectly along a river (collinear overlap).
+# Contours: traced as polylines along iso-value bands of the elevation
+#   field.  We use a coarse marching-grid approach: for each elevation
+#   level, walk a perimeter sampling and connect adjacent grid cells
+#   that straddle the level.  Output is intentionally noisy/jagged to
+#   mimic real contour generators without depending on Spatial Analyst.
 #
-#   * Rivers:   long sinuous polylines using a sin-wave perturbation;
-#               gives many proper crossings with the road network.
-#
-# Edge cases injected:
-#
-#   * True crossings: ~50,000 emerging from network density.
-#     With ~6000 roads and ~3500 rivers in a 20km box the expected
-#     pairwise true-crossing count comfortably exceeds 50k.
-#
-#   * T-junctions: 1500 short road stubs whose end-vertex is placed
-#     EXACTLY on a river vertex.  These should be rejected by a
-#     "true crossing" filter and accepted by a naive "intersects" check.
-#
-#   * Collinear overlaps: 400 road segments coincident with a river
-#     segment for a fixed length.  These create infinite intersection
-#     sets and must be filtered out.
+# Titan Ridge: a single 500k-vertex polyline placed AT the NW peak.
+#   We use a fractal-perturbed logarithmic spiral, recentered on the
+#   peak and scaled to fit just below the peak summit.
 # ---------------------------------------------------------------------------
 
 
-def _build_road_polyline(idx, sr):
-    """Return (coords, attrs) for a single road feature."""
-    # Choose orientation: 0=horizontal, 1=vertical, 2=diagonal.
-    orient = random.choice([0, 0, 1, 1, 2])
-    n_pts = random.randint(6, 18)
+def build_stage1_terrain(gdb, sr):
+    log("STAGE 1: Elevation_Points + Contours + Titan Ridge")
 
-    if orient == 0:
-        y0 = YMIN + random.random() * HEIGHT
-        x0 = XMIN + random.random() * (WIDTH * 0.05)
-        x_step = (WIDTH * random.uniform(0.2, 0.95)) / float(n_pts - 1)
-        coords = []
-        x, y = x0, y0
-        for i in range(n_pts):
-            coords.append((x + jitter(15.0), y + jitter(60.0)))
-            x += x_step
-    elif orient == 1:
-        x0 = XMIN + random.random() * WIDTH
-        y0 = YMIN + random.random() * (HEIGHT * 0.05)
-        y_step = (HEIGHT * random.uniform(0.2, 0.95)) / float(n_pts - 1)
-        coords = []
-        x, y = x0, y0
-        for i in range(n_pts):
-            coords.append((x + jitter(60.0), y + jitter(15.0)))
-            y += y_step
-    else:
-        x0 = XMIN + random.random() * WIDTH * 0.4
-        y0 = YMIN + random.random() * HEIGHT * 0.4
-        ang = random.uniform(-math.pi / 3.0, math.pi / 3.0)
-        seg_len = random.uniform(800.0, 4500.0) / float(n_pts - 1)
-        coords = []
-        x, y = x0, y0
-        for i in range(n_pts):
-            coords.append((x + jitter(20.0), y + jitter(20.0)))
-            x += math.cos(ang) * seg_len
-            y += math.sin(ang) * seg_len
+    # ------------------------------------------------------------------
+    # Elevation_Points
+    # ------------------------------------------------------------------
+    elev_fc = create_fc(
+        gdb, "Elevation_Points", "POINT", sr,
+        [
+            ("PointID", "LONG", None),
+            ("Elevation", "DOUBLE", None),
+            ("Slope", "DOUBLE", None),
+            ("Zone", "TEXT", 32),
+        ],
+    )
+    log("  sampling Elevation_Points ({0})...".format(N_ELEVATION_POINTS))
+    with arcpy.da.InsertCursor(
+            elev_fc,
+            ["SHAPE@", "PointID", "Elevation", "Slope", "Zone"]) as ec:
+        for i in range(N_ELEVATION_POINTS):
+            x = XMIN + random.random() * WIDTH
+            y = YMIN + random.random() * HEIGHT
+            z = get_elevation(x, y)
+            s = get_slope(x, y)
+            if is_on_plain(x, y):
+                zone = "Plain"
+            elif z >= ELEV_BASE + 0.5 * ELEV_AMPLITUDE:
+                zone = "Mountain"
+            elif is_on_mountain_foot(x, y):
+                zone = "MountainFoot"
+            else:
+                zone = "Hill"
+            ec.insertRow([make_point(x, y, sr), i, z, s, zone])
 
+    # ------------------------------------------------------------------
+    # Contours via a marching-segments pass over a coarse grid
+    # ------------------------------------------------------------------
+    contours_fc = create_fc(
+        gdb, "Contours", "POLYLINE", sr,
+        [
+            ("ContourID", "LONG", None),
+            ("Elevation", "DOUBLE", None),
+            ("Index_Contour", "SHORT", None),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+
+    # Choose elevation levels spanning a realistic range, every ~70 m.
+    z_min = ELEV_BASE - ELEV_AMPLITUDE * 0.6
+    z_max = ELEV_BASE + ELEV_AMPLITUDE * 1.4
+    levels = []
+    step = (z_max - z_min) / float(N_CONTOUR_LEVELS - 1)
+    for i in range(N_CONTOUR_LEVELS):
+        levels.append(round((z_min + i * step) / 10.0) * 10.0)
+
+    # Marching grid: 240 x 240 cells (~83 m per cell over 20 km).
+    grid_n = 240
+    cell_w = WIDTH / float(grid_n)
+    cell_h = HEIGHT / float(grid_n)
+
+    # Pre-compute the elevation field on the grid corners once.
+    log("  pre-computing elevation grid {0}x{0}...".format(grid_n))
+    Z = [[0.0] * (grid_n + 1) for _ in range(grid_n + 1)]
+    for j in range(grid_n + 1):
+        yj = YMIN + j * cell_h
+        row = Z[j]
+        for i in range(grid_n + 1):
+            row[i] = get_elevation(XMIN + i * cell_w, yj)
+
+    next_id = 0
+    contour_fields = ["SHAPE@", "ContourID", "Elevation",
+                      "Index_Contour", "EdgeCase"]
+    with arcpy.da.InsertCursor(contours_fc, contour_fields) as cc:
+        for level in levels:
+            log("  contour level {0:.0f} m...".format(level))
+            # Walk every cell, emit short segments where the level crosses
+            # the cell's bilinear isoline.  We then chain adjacent
+            # segments into longer polylines per cell-row to keep things
+            # cheap and avoid building a full graph.
+            row_segments = []  # accumulator for the current scan-row
+            current_row_y = None
+            emitted_this_level = 0
+            for j in range(grid_n):
+                if emitted_this_level >= N_CONTOURS_PER_LEVEL_MAX:
+                    break
+                row_chain = []   # current chain of (x, y) for this row
+                for i in range(grid_n):
+                    z00 = Z[j][i]
+                    z10 = Z[j][i + 1]
+                    z01 = Z[j + 1][i]
+                    z11 = Z[j + 1][i + 1]
+                    z_lo = min(z00, z10, z01, z11)
+                    z_hi = max(z00, z10, z01, z11)
+                    if level < z_lo or level > z_hi:
+                        if row_chain and len(row_chain) >= 2:
+                            row_segments.append(row_chain)
+                            row_chain = []
+                        continue
+                    # Find one representative point on each cell edge that
+                    # the level crosses; connect them.
+                    pts = []
+                    x0 = XMIN + i * cell_w
+                    y0 = YMIN + j * cell_h
+                    x1 = x0 + cell_w
+                    y1 = y0 + cell_h
+                    # Bottom edge
+                    if (z00 <= level <= z10) or (z10 <= level <= z00):
+                        if abs(z10 - z00) > 1e-9:
+                            t = (level - z00) / (z10 - z00)
+                        else:
+                            t = 0.5
+                        pts.append((x0 + cell_w * t, y0))
+                    # Top edge
+                    if (z01 <= level <= z11) or (z11 <= level <= z01):
+                        if abs(z11 - z01) > 1e-9:
+                            t = (level - z01) / (z11 - z01)
+                        else:
+                            t = 0.5
+                        pts.append((x0 + cell_w * t, y1))
+                    # Left edge
+                    if (z00 <= level <= z01) or (z01 <= level <= z00):
+                        if abs(z01 - z00) > 1e-9:
+                            t = (level - z00) / (z01 - z00)
+                        else:
+                            t = 0.5
+                        pts.append((x0, y0 + cell_h * t))
+                    # Right edge
+                    if (z10 <= level <= z11) or (z11 <= level <= z10):
+                        if abs(z11 - z10) > 1e-9:
+                            t = (level - z10) / (z11 - z10)
+                        else:
+                            t = 0.5
+                        pts.append((x1, y0 + cell_h * t))
+                    if len(pts) >= 2:
+                        # If chain is empty, seed it; else connect.
+                        if not row_chain:
+                            row_chain.append(pts[0])
+                            row_chain.append(pts[-1])
+                        else:
+                            row_chain.append(pts[-1])
+                    else:
+                        if row_chain and len(row_chain) >= 2:
+                            row_segments.append(row_chain)
+                        row_chain = []
+                if row_chain and len(row_chain) >= 2:
+                    row_segments.append(row_chain)
+
+            # Emit polylines for this level (cap to N_CONTOURS_PER_LEVEL_MAX)
+            for chain in row_segments:
+                if emitted_this_level >= N_CONTOURS_PER_LEVEL_MAX:
+                    break
+                if len(chain) < 2:
+                    continue
+                polyline = make_polyline(chain, sr)
+                idx_flag = 1 if int(round(level)) % 100 == 0 else 0
+                cc.insertRow([
+                    polyline, next_id, float(level), idx_flag, "Normal",
+                ])
+                next_id += 1
+                emitted_this_level += 1
+
+        # Titan Ridge: single 500k-vertex polyline anchored on NW peak.
+        log("  building Titan Ridge ({0} vertices)...".format(
+            TITAN_RIDGE_VERTICES))
+        peak_x, peak_y = find_peak_world_xy(0)
+        titan_coords = _build_titan_ridge_at(
+            peak_x, peak_y, TITAN_RIDGE_VERTICES)
+        titan_arr = arcpy.Array()
+        add = titan_arr.add
+        for (x, y) in titan_coords:
+            add(arcpy.Point(x, y))
+        titan_polyline = arcpy.Polyline(titan_arr, sr)
+        # Use the elevation at the peak as nominal contour value.
+        peak_elev = get_elevation(peak_x, peak_y)
+        cc.insertRow([
+            titan_polyline, next_id, peak_elev, 1, "Titan_Ridge",
+        ])
+        next_id += 1
+        log("  Titan Ridge inserted (length ~{0:.1f} m, peak elev ~{1:.0f} m)"
+            .format(titan_polyline.length, peak_elev))
+
+    log("STAGE 1: contours total = {0}".format(next_id))
+    return elev_fc, contours_fc
+
+
+def _build_titan_ridge_at(cx, cy, n_vertices):
+    """Fractal-perturbed logarithmic spiral centered on (cx, cy).
+
+    Stays within ~1.5 km of the peak so the ridge actually decorates the
+    summit instead of sprawling across the world.
+    """
+    a = 1.0
+    b = 0.05
+    octaves = [
+        (1.0, 0.013),
+        (0.5, 0.041),
+        (0.25, 0.137),
+        (0.12, 0.421),
+        (0.06, 1.113),
+        (0.03, 3.371),
+    ]
+    max_radius = 1500.0
+    coords = []
+    append = coords.append
+    sin = math.sin
+    cos = math.cos
+    exp = math.exp
+    for i in range(n_vertices):
+        theta = i * 0.0008
+        r = a * exp(b * theta)
+        if r > max_radius:
+            r = max_radius
+        pert = 0.0
+        for amp, freq in octaves:
+            pert += amp * sin(theta * freq * 12.566 + i * 0.0001)
+        rr = r * (1.0 + 0.07 * pert)
+        x = cx + rr * cos(theta)
+        y = cy + rr * sin(theta)
+        if x < XMIN + 1.0:
+            x = XMIN + 1.0
+        elif x > XMAX - 1.0:
+            x = XMAX - 1.0
+        if y < YMIN + 1.0:
+            y = YMIN + 1.0
+        elif y > YMAX - 1.0:
+            y = YMAX - 1.0
+        append((x, y))
+    return coords
+
+
+
+# ===========================================================================
+# STAGE 2 - Hydrology: rivers descend along the negative gradient
+# ===========================================================================
+#
+# Each river starts at a high-elevation seed point (mountainous area) and
+# is integrated downstream by following -grad(elevation) with a small
+# random walk to keep it from looking too clinical.  Rivers stop when:
+#   * they reach the bbox edge,
+#   * they enter the central plain and slope is near zero,
+#   * step count exceeds a hard cap.
+# Vertices and segments are sampled into pools used by P01 edge cases
+# (T-junctions, collinear overlaps).
+# ---------------------------------------------------------------------------
+
+
+def build_stage2_hydrology(gdb, sr):
+    log("STAGE 2: Drainage (rivers descend valleys)")
+
+    rivers_fc = create_fc(
+        gdb, "Drainage", "POLYLINE", sr,
+        [
+            ("RiverID", "LONG", None),
+            ("Stream", "TEXT", 16),
+            ("Name", "TEXT", 64),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+
+    river_vertex_pool = []   # for T-junctions
+    river_segment_pool = []  # for collinear overlaps
+    river_polylines_coords = []   # for road bridge planning later
+
+    step_size = 60.0          # ~60 m per integration step
+    max_steps = 600
+    n_done = 0
+
+    river_fields = ["SHAPE@", "RiverID", "Stream", "Name", "EdgeCase"]
+    with arcpy.da.InsertCursor(rivers_fc, river_fields) as rc:
+        attempts = 0
+        while n_done < N_RIVERS and attempts < N_RIVERS * 12:
+            attempts += 1
+            # Seed near a peak with a slight offset.
+            peak_idx = random.randint(0, len(PEAKS_NORM) - 1)
+            pcx, pcy, _ = PEAKS_NORM[peak_idx]
+            sx = XMIN + (pcx + jitter(0.06)) * WIDTH
+            sy = YMIN + (pcy + jitter(0.06)) * HEIGHT
+            sx = clamp(sx, XMIN + 50.0, XMAX - 50.0)
+            sy = clamp(sy, YMIN + 50.0, YMAX - 50.0)
+            if get_elevation(sx, sy) < ELEV_BASE + 0.3 * ELEV_AMPLITUDE:
+                continue
+
+            coords = [(sx, sy)]
+            x, y = sx, sy
+            for _step in range(max_steps):
+                gx, gy = get_gradient(x, y)
+                gmag = math.hypot(gx, gy)
+                if gmag < 1e-6:
+                    # Plateau: pick a random direction to keep moving.
+                    ang = random.uniform(0.0, 2.0 * math.pi)
+                    ux, uy = math.cos(ang), math.sin(ang)
+                else:
+                    # Descend: -grad / |grad|
+                    ux = -gx / gmag
+                    uy = -gy / gmag
+                # Add small lateral wander so rivers meander.
+                wander = random.uniform(-0.35, 0.35)
+                cs = math.cos(wander)
+                sn = math.sin(wander)
+                ux2 = ux * cs - uy * sn
+                uy2 = ux * sn + uy * cs
+                x += ux2 * step_size
+                y += uy2 * step_size
+                if not in_bbox(x, y, pad=20.0):
+                    coords.append((clamp(x, XMIN + 1.0, XMAX - 1.0),
+                                   clamp(y, YMIN + 1.0, YMAX - 1.0)))
+                    break
+                coords.append((x, y))
+                # Stop if we've reached the plain and are essentially flat.
+                if is_on_plain(x, y) and gmag < 0.005:
+                    break
+            if len(coords) < 5:
+                continue
+
+            polyline = make_polyline(coords, sr)
+            stream = random.choice(["Perennial", "Intermittent", "Ephemeral"])
+            rc.insertRow([
+                polyline, n_done, stream,
+                "River_{0:04d}".format(n_done), "Normal",
+            ])
+            river_polylines_coords.append(coords)
+
+            # Sample vertices/segments for later edge-case injection.
+            for k in range(0, len(coords), 4):
+                if len(river_vertex_pool) < 50000:
+                    river_vertex_pool.append(coords[k])
+            for k in range(0, len(coords) - 1, 6):
+                if len(river_segment_pool) < 5000:
+                    river_segment_pool.append((coords[k], coords[k + 1]))
+            n_done += 1
+            if n_done % 10 == 0:
+                log("  rivers traced: {0}/{1}".format(n_done, N_RIVERS))
+
+    log("STAGE 2: complete. rivers = {0}".format(n_done))
+    return rivers_fc, river_polylines_coords, \
+        river_vertex_pool, river_segment_pool
+
+
+# ===========================================================================
+# STAGE 3 - Roads (flat terrain), with bridge crossings + edge cases
+# ===========================================================================
+#
+# Trunks: long polylines that stay in the plain or low-slope valleys
+# (slope < threshold).  When the unconstrained path would cross a river
+# we snap the crossing point so that the road meets the river at
+# 90 degrees (or 45 for diagonal-feel variation), guaranteeing a valid
+# bridge/culvert event.
+#
+# Local connectors: shorter polylines branching off trunks.
+#
+# Edge cases injected at the end, into a dedicated "EdgeCase" column:
+#   * T-junction stubs    -> end-vertex on a river vertex (P01 stress)
+#   * Collinear overlaps  -> road segment coincident with river segment
+# ---------------------------------------------------------------------------
+
+
+def _segments_from_polyline(coords):
+    """yield ((x1, y1), (x2, y2)) segments."""
+    for i in range(1, len(coords)):
+        yield coords[i - 1], coords[i]
+
+
+def _seg_intersect(p1, p2, p3, p4):
+    """Returns the intersection point of segments p1-p2 and p3-p4 or None.
+
+    Pure-python 2D segment intersection.  Returns (x, y, t, u) where
+    t is param along p1->p2 and u along p3->p4.
+    """
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    x4, y4 = p4
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-12:
+        return None
+    t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
+    u_num = (x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)
+    t = t_num / denom
+    u = u_num / denom
+    if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+        ix = x1 + t * (x2 - x1)
+        iy = y1 + t * (y2 - y1)
+        return ix, iy, t, u
+    return None
+
+
+def _find_river_bridge(road_seg, river_polylines_coords):
+    """If road_seg crosses a river, return (cx, cy, river_idx, river_seg_idx,
+    river_dir_unit_vec).  Otherwise return None.
+    """
+    p1, p2 = road_seg
+    for ridx, rcoords in enumerate(river_polylines_coords):
+        # Quick AABB check
+        rxs = [c[0] for c in rcoords]
+        rys = [c[1] for c in rcoords]
+        if (max(p1[0], p2[0]) < min(rxs) or
+                min(p1[0], p2[0]) > max(rxs) or
+                max(p1[1], p2[1]) < min(rys) or
+                min(p1[1], p2[1]) > max(rys)):
+            continue
+        for j in range(1, len(rcoords)):
+            r1 = rcoords[j - 1]
+            r2 = rcoords[j]
+            hit = _seg_intersect(p1, p2, r1, r2)
+            if hit is not None:
+                ix, iy, _t, _u = hit
+                rdx = r2[0] - r1[0]
+                rdy = r2[1] - r1[1]
+                rL = math.hypot(rdx, rdy)
+                if rL < 1e-9:
+                    continue
+                return ix, iy, ridx, j - 1, (rdx / rL, rdy / rL)
+    return None
+
+
+def _trace_road_in_low_slope(start_xy, target_xy, river_polylines_coords,
+                             max_pts=120):
+    """Walk from start_xy toward target_xy in low-slope corridors.
+
+    The walk biases each step toward the target but rejects steps where
+    the slope at the new location is high (mountains / cliffs).  When a
+    proposed step would cross a river segment we snap the next vertex
+    to the river crossing so the road meets the river at near 90 deg.
+    """
+    coords = [start_xy]
+    x, y = start_xy
+    tx, ty = target_xy
+    step = 90.0
+    slope_max_plain = 0.04
+    slope_max_valley = 0.10
+    bridge_count = 0
+
+    for _ in range(max_pts):
+        dxg = tx - x
+        dyg = ty - y
+        d_to_target = math.hypot(dxg, dyg)
+        if d_to_target < step:
+            coords.append((tx, ty))
+            break
+        ux = dxg / d_to_target
+        uy = dyg / d_to_target
+
+        # Try the direct step; if slope too high, sample alternative
+        # directions (jittered) and take the one with lowest slope that
+        # still moves us closer.
+        candidates = []
+        for ang_off in (0.0, 0.25, -0.25, 0.55, -0.55, 0.9, -0.9):
+            cos_a = math.cos(ang_off)
+            sin_a = math.sin(ang_off)
+            cx = ux * cos_a - uy * sin_a
+            cy = ux * sin_a + uy * cos_a
+            nx_ = x + cx * step
+            ny_ = y + cy * step
+            if not in_bbox(nx_, ny_, pad=10.0):
+                continue
+            slope_here = get_slope(nx_, ny_)
+            limit = (slope_max_plain
+                     if is_on_plain(nx_, ny_)
+                     else slope_max_valley)
+            if slope_here > limit:
+                continue
+            # Penalty: how much we deviated from target direction.
+            penalty = 1.0 - (cx * ux + cy * uy)
+            candidates.append((slope_here + penalty * 0.05, nx_, ny_))
+        if not candidates:
+            # Stuck: bail with what we have.
+            break
+        candidates.sort()
+        _, nx_, ny_ = candidates[0]
+
+        # River-crossing snap: if the segment (x,y)->(nx_,ny_) crosses a
+        # river, replace the move so we land exactly on the crossing,
+        # then add an extra perpendicular departure point so the next
+        # step naturally exits at ~90 deg.
+        bridge = _find_river_bridge(
+            ((x, y), (nx_, ny_)), river_polylines_coords)
+        if bridge is not None and bridge_count < 8:
+            ix, iy, _ridx, _seg_idx, (rux, ruy) = bridge
+            # Perpendicular to river: choose the side of (nx_, ny_).
+            # Two candidates: rotate +90 or -90 around river dir.
+            perp_a = (-ruy, rux)
+            perp_b = (ruy, -rux)
+            # Pick the one that moves us toward the target.
+            ax = ix + perp_a[0] * step * 0.5
+            ay = iy + perp_a[1] * step * 0.5
+            bx = ix + perp_b[0] * step * 0.5
+            by = iy + perp_b[1] * step * 0.5
+            da = (ax - tx) ** 2 + (ay - ty) ** 2
+            db = (bx - tx) ** 2 + (by - ty) ** 2
+            if da < db:
+                ex_x, ex_y = ax, ay
+            else:
+                ex_x, ex_y = bx, by
+            # Approach point: opposite side of river from exit.
+            ax_x = 2.0 * ix - ex_x
+            ax_y = 2.0 * iy - ex_y
+            # Insert: approach -> crossing -> exit (perpendicular).
+            coords.append((ax_x, ax_y))
+            coords.append((ix, iy))
+            coords.append((ex_x, ex_y))
+            x, y = ex_x, ex_y
+            bridge_count += 1
+            continue
+
+        coords.append((nx_, ny_))
+        x, y = nx_, ny_
+
+    # Clamp all to bbox
     coords = [(clamp(cx, XMIN + 1.0, XMAX - 1.0),
                clamp(cy, YMIN + 1.0, YMAX - 1.0)) for (cx, cy) in coords]
-
-    attrs = {
-        "RoadID": idx,
-        "RoadClass": random.choice(["Primary", "Secondary", "Local",
-                                    "Track", "Highway"]),
-        "Surface": random.choice(["Paved", "Gravel", "Dirt"]),
-        "SpeedLimit": random.choice([30, 40, 50, 60, 80, 100, 120]),
-    }
-    return coords, attrs
+    return coords
 
 
-def _build_river_polyline(idx, sr):
-    """Sinuous river polyline, returns (coords, attrs)."""
-    n_pts = random.randint(20, 60)
-
-    if random.random() < 0.5:
-        # Mostly east-flowing.
-        x0 = XMIN + random.random() * WIDTH * 0.05
-        y_base = YMIN + random.random() * HEIGHT
-        x_step = (WIDTH * random.uniform(0.5, 0.98)) / float(n_pts - 1)
-        amp = random.uniform(80.0, 400.0)
-        wavelength = random.uniform(800.0, 3500.0)
-        coords = []
-        x = x0
-        for i in range(n_pts):
-            y = y_base + amp * math.sin((x - x0) * 2.0 * math.pi / wavelength)
-            coords.append((x + jitter(10.0), y + jitter(10.0)))
-            x += x_step
-    else:
-        # Mostly south-flowing.
-        y0 = YMIN + random.random() * HEIGHT * 0.05
-        x_base = XMIN + random.random() * WIDTH
-        y_step = (HEIGHT * random.uniform(0.5, 0.98)) / float(n_pts - 1)
-        amp = random.uniform(80.0, 400.0)
-        wavelength = random.uniform(800.0, 3500.0)
-        coords = []
-        y = y0
-        for i in range(n_pts):
-            x = x_base + amp * math.sin((y - y0) * 2.0 * math.pi / wavelength)
-            coords.append((x + jitter(10.0), y + jitter(10.0)))
-            y += y_step
-
-    coords = [(clamp(cx, XMIN + 1.0, XMAX - 1.0),
-               clamp(cy, YMIN + 1.0, YMAX - 1.0)) for (cx, cy) in coords]
-
-    attrs = {
-        "RiverID": idx,
-        "Stream": random.choice(["Perennial", "Intermittent", "Ephemeral"]),
-        "Name": "River_{0:05d}".format(idx),
-    }
-    return coords, attrs
-
-
-def build_p01_roads_and_rivers(gdb, sr):
-    log("P01: building Roads + Drainage networks...")
+def build_stage3_roads(gdb, sr, river_polylines_coords,
+                       river_vertex_pool, river_segment_pool):
+    log("STAGE 3: Roads (flat terrain, bridges over rivers)")
 
     roads_fc = create_fc(
         gdb, "Roads", "POLYLINE", sr,
@@ -351,110 +907,131 @@ def build_p01_roads_and_rivers(gdb, sr):
             ("EdgeCase", "TEXT", 32),
         ],
     )
-    rivers_fc = create_fc(
-        gdb, "Drainage", "POLYLINE", sr,
-        [
-            ("RiverID", "LONG", None),
-            ("Stream", "TEXT", 16),
-            ("Name", "TEXT", 64),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
 
-    # ----- Rivers first; we'll reuse some river vertices for T-junctions -----
-    river_vertex_pool = []   # list of (x, y) for T-junction snapping
-    river_segment_pool = []  # list of ((x1, y1), (x2, y2)) for collinear overlap
-    river_geoms_for_collinear = []
+    plain_cx = XMIN + PLAIN_CENTER_NORM[0] * WIDTH
+    plain_cy = YMIN + PLAIN_CENTER_NORM[1] * HEIGHT
 
-    river_fields = ["SHAPE@", "RiverID", "Stream", "Name", "EdgeCase"]
-    with arcpy.da.InsertCursor(rivers_fc, river_fields) as rc:
-        for i in range(N_RIVERS):
-            coords, attrs = _build_river_polyline(i, sr)
-            polyline = make_polyline(coords, sr)
-            rc.insertRow([
-                polyline,
-                attrs["RiverID"],
-                attrs["Stream"],
-                attrs["Name"],
-                "Normal",
-            ])
-            # Sample a few vertices and segments for later edge-case use.
-            if len(river_vertex_pool) < 50000 and random.random() < 0.5:
-                vx = random.choice(coords)
-                river_vertex_pool.append(vx)
-            if len(river_segment_pool) < 5000 and len(coords) >= 2:
-                k = random.randint(0, len(coords) - 2)
-                river_segment_pool.append((coords[k], coords[k + 1]))
-                river_geoms_for_collinear.append(coords)
-            if (i + 1) % 1000 == 0:
-                log("  rivers inserted: {0}/{1}".format(i + 1, N_RIVERS))
+    next_road_id = 0
+    trunk_endpoints = []   # used to seed local connectors
 
-    # ----- Roads -----
     road_fields = ["SHAPE@", "RoadID", "RoadClass", "Surface",
                    "SpeedLimit", "EdgeCase"]
-    next_road_id = 0
     with arcpy.da.InsertCursor(roads_fc, road_fields) as rc:
-        # Background random roads (drives the true-crossing count).
-        for i in range(N_ROADS):
-            coords, attrs = _build_road_polyline(next_road_id, sr)
-            polyline = make_polyline(coords, sr)
-            rc.insertRow([
-                polyline,
-                attrs["RoadID"],
-                attrs["RoadClass"],
-                attrs["Surface"],
-                attrs["SpeedLimit"],
-                "Normal",
-            ])
-            next_road_id += 1
-            if (i + 1) % 1000 == 0:
-                log("  roads inserted: {0}/{1}".format(i + 1, N_ROADS))
+        # ----- Trunks -----
+        log("  laying {0} trunk roads...".format(N_ROAD_TRUNK_LINES))
+        for ti in range(N_ROAD_TRUNK_LINES):
+            # Pick a starting bbox-edge anchor and route THROUGH the plain
+            # to an opposite-side anchor.  This gives us long roads that
+            # naturally pass through the city.
+            side = ti % 4
+            if side == 0:
+                start = (XMIN + 200.0,
+                         YMIN + random.random() * HEIGHT)
+                end = (XMAX - 200.0,
+                       YMIN + random.random() * HEIGHT)
+            elif side == 1:
+                start = (XMIN + random.random() * WIDTH,
+                         YMIN + 200.0)
+                end = (XMIN + random.random() * WIDTH,
+                       YMAX - 200.0)
+            elif side == 2:
+                start = (XMIN + 200.0,
+                         YMIN + random.random() * HEIGHT)
+                end = (plain_cx + jitter(2000.0),
+                       plain_cy + jitter(2000.0))
+            else:
+                start = (plain_cx + jitter(2000.0),
+                         plain_cy + jitter(2000.0))
+                end = (XMAX - 200.0,
+                       YMIN + random.random() * HEIGHT)
 
-        # T-junction stubs: a tiny road segment whose endpoint is exactly
-        # on a river vertex.  This is the classic "end-touches" false positive
-        # that the bridge/culvert plugin's true-crossing filter must reject.
+            coords = _trace_road_in_low_slope(
+                start, end, river_polylines_coords, max_pts=160)
+            if len(coords) < 2:
+                continue
+            polyline = make_polyline(coords, sr)
+            klass = random.choice(["Primary", "Highway", "Secondary"])
+            rc.insertRow([
+                polyline, next_road_id, klass,
+                "Paved", random.choice([60, 80, 100, 120]),
+                "Trunk",
+            ])
+            trunk_endpoints.append(coords)
+            next_road_id += 1
+
+        # ----- Local connectors -----
+        log("  building local connectors off trunks...")
+        for trunk_coords in trunk_endpoints:
+            for _li in range(N_ROAD_LOCAL_PER_TRUNK):
+                if len(trunk_coords) < 2:
+                    continue
+                k = random.randint(0, len(trunk_coords) - 1)
+                bx, by = trunk_coords[k]
+                # Connector heads ~500..1500 m off the trunk into the plain.
+                ang = random.uniform(0.0, 2.0 * math.pi)
+                length = random.uniform(500.0, 1500.0)
+                ex_x = bx + math.cos(ang) * length
+                ex_y = by + math.sin(ang) * length
+                ex_x = clamp(ex_x, XMIN + 50.0, XMAX - 50.0)
+                ex_y = clamp(ex_y, YMIN + 50.0, YMAX - 50.0)
+                # Skip if the endpoint sits on a steep slope.
+                if get_slope(ex_x, ex_y) > 0.12:
+                    continue
+                coords = _trace_road_in_low_slope(
+                    (bx, by), (ex_x, ex_y), river_polylines_coords,
+                    max_pts=40)
+                if len(coords) < 2:
+                    continue
+                polyline = make_polyline(coords, sr)
+                rc.insertRow([
+                    polyline, next_road_id,
+                    random.choice(["Local", "Track"]),
+                    random.choice(["Paved", "Gravel", "Dirt"]),
+                    random.choice([30, 40, 50]),
+                    "Local",
+                ])
+                next_road_id += 1
+
+        # ----- Edge case: T-junction stubs -----
         log("  injecting {0} T-junction stubs...".format(N_T_JUNCTIONS))
-        for i in range(N_T_JUNCTIONS):
+        injected = 0
+        for _i in range(N_T_JUNCTIONS):
             if not river_vertex_pool:
                 break
             tx, ty = random.choice(river_vertex_pool)
             ang = random.uniform(0.0, 2.0 * math.pi)
             length = random.uniform(20.0, 120.0)
-            ex = tx + math.cos(ang) * length
-            ey = ty + math.sin(ang) * length
-            ex = clamp(ex, XMIN + 1.0, XMAX - 1.0)
-            ey = clamp(ey, YMIN + 1.0, YMAX - 1.0)
-            coords = [(ex, ey), (tx, ty)]  # endpoint AT the river vertex
-            polyline = make_polyline(coords, sr)
+            ex_x = clamp(tx + math.cos(ang) * length,
+                         XMIN + 1.0, XMAX - 1.0)
+            ex_y = clamp(ty + math.sin(ang) * length,
+                         YMIN + 1.0, YMAX - 1.0)
+            polyline = make_polyline([(ex_x, ex_y), (tx, ty)], sr)
             rc.insertRow([
                 polyline, next_road_id, "TJunction_Stub",
                 "Paved", 30, "T_Junction",
             ])
             next_road_id += 1
+            injected += 1
+        log("  T-junctions injected: {0}".format(injected))
 
-        # Collinear overlaps: a road that lies exactly along a river segment
-        # for the full length of that segment, then continues a bit further.
+        # ----- Edge case: Collinear overlaps -----
         log("  injecting {0} collinear road/river overlaps..."
             .format(N_COLLINEAR_OVERLAPS))
-        for i in range(min(N_COLLINEAR_OVERLAPS, len(river_segment_pool))):
+        n_over = min(N_COLLINEAR_OVERLAPS, len(river_segment_pool))
+        for i in range(n_over):
             (rx1, ry1), (rx2, ry2) = river_segment_pool[i]
-            # Extend the segment along its own direction so the road also
-            # reaches beyond the river segment (still collinear).
             dx = rx2 - rx1
             dy = ry2 - ry1
             seg_len = math.hypot(dx, dy)
             if seg_len < 1e-6:
                 continue
-            ux, uy = dx / seg_len, dy / seg_len
+            ux = dx / seg_len
+            uy = dy / seg_len
             ext = random.uniform(50.0, 250.0)
-            ax = rx1 - ux * ext
-            ay = ry1 - uy * ext
-            bx = rx2 + ux * ext
-            by = ry2 + uy * ext
-            ax = clamp(ax, XMIN + 1.0, XMAX - 1.0)
-            ay = clamp(ay, YMIN + 1.0, YMAX - 1.0)
-            bx = clamp(bx, XMIN + 1.0, XMAX - 1.0)
-            by = clamp(by, YMIN + 1.0, YMAX - 1.0)
+            ax = clamp(rx1 - ux * ext, XMIN + 1.0, XMAX - 1.0)
+            ay = clamp(ry1 - uy * ext, YMIN + 1.0, YMAX - 1.0)
+            bx = clamp(rx2 + ux * ext, XMIN + 1.0, XMAX - 1.0)
+            by = clamp(ry2 + uy * ext, YMIN + 1.0, YMAX - 1.0)
             coords = [(ax, ay), (rx1, ry1), (rx2, ry2), (bx, by)]
             polyline = make_polyline(coords, sr)
             rc.insertRow([
@@ -463,250 +1040,33 @@ def build_p01_roads_and_rivers(gdb, sr):
             ])
             next_road_id += 1
 
-    log("P01: complete. roads={0} rivers={1}".format(next_road_id, N_RIVERS))
-    return roads_fc, rivers_fc
+    log("STAGE 3: complete. roads = {0}".format(next_road_id))
+    return roads_fc, trunk_endpoints
 
 
 
 # ===========================================================================
-# P02 - Road Deconflict (Power_Lines, Gas_Pipes, Buildings)
+# STAGE 4 - Megacity & Utilities
 # ===========================================================================
 #
-# Edge cases:
-#   * Gas pipes running EXACTLY under road centerlines (full coincident).
-#   * Power lines crossing roads at acute (<= 15 degree) angles.
-#   * 10,000+ buildings tightly packed along a SINGLE 1km road segment to
-#     stress GenerateNearTable's spatial index.
+# Buildings: small rectangles offset perpendicular to a city road that
+# lives in the plain.  We pick the longest plain-resident road (by
+# length actually inside the plain mask) and pack 10,000+ buildings
+# along its first ~1 km.  Buildings are validated against:
+#   * not on roads (offset is away from road centerline)
+#   * not on rivers (rejection sampling)
+#   * elevation is in plain band (rejection sampling)
+#
+# Gas pipes: half copy a road geometry verbatim (parallel-under-road),
+# the rest run as background pipes outside the plain.
+#
+# Power lines: half run alongside roads at a small lateral offset,
+# a dedicated zone of 400 lines crosses roads at acute angles to stress
+# Plugin 02, the rest are background.
+#
+# Label_Candidate_Boxes: heavy clustering hot-spots for P04 numpy AABB
+# collision logic.
 # ---------------------------------------------------------------------------
-
-
-def _sample_road_geometries(roads_fc, max_count=4000):
-    """Return a list of polyline geometries from the roads FC."""
-    out = []
-    with arcpy.da.SearchCursor(roads_fc, ["SHAPE@", "OID@", "EdgeCase"]) as sc:
-        for row in sc:
-            shp, _oid, edge = row
-            if edge != "Normal":
-                continue
-            if shp is None or shp.length < 200.0:
-                continue
-            out.append(shp)
-            if len(out) >= max_count:
-                break
-    return out
-
-
-def _polyline_coords(polyline):
-    coords = []
-    for part in polyline:
-        for pt in part:
-            if pt is None:
-                continue
-            coords.append((pt.X, pt.Y))
-    return coords
-
-
-def build_p02_power_gas_buildings(gdb, sr, roads_fc):
-    log("P02: building Power_Lines, Gas_Pipes, Buildings...")
-
-    power_fc = create_fc(
-        gdb, "Power_Lines", "POLYLINE", sr,
-        [
-            ("LineID", "LONG", None),
-            ("Voltage_kV", "SHORT", None),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
-    gas_fc = create_fc(
-        gdb, "Gas_Pipes", "POLYLINE", sr,
-        [
-            ("PipeID", "LONG", None),
-            ("Pressure_PSI", "SHORT", None),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
-    bld_fc = create_fc(
-        gdb, "Buildings", "POLYGON", sr,
-        [
-            ("BldID", "LONG", None),
-            ("Height_m", "FLOAT", None),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
-
-    road_shapes = _sample_road_geometries(roads_fc, max_count=4000)
-    log("  sampled {0} background road geometries".format(len(road_shapes)))
-
-    # ----- Gas pipes: many of them lie EXACTLY on a road centerline -----
-    next_pipe_id = 0
-    with arcpy.da.InsertCursor(
-            gas_fc, ["SHAPE@", "PipeID", "Pressure_PSI", "EdgeCase"]) as gc:
-        # Pipe-under-road: copy a road geometry verbatim.
-        n_under = min(len(road_shapes), int(N_GAS_PIPES * 0.4))
-        for i in range(n_under):
-            road_shape = road_shapes[i]
-            coords = _polyline_coords(road_shape)
-            if len(coords) < 2:
-                continue
-            polyline = make_polyline(coords, sr)
-            gc.insertRow([polyline, next_pipe_id,
-                          random.choice([60, 100, 250, 600]),
-                          "Pipe_Under_Road"])
-            next_pipe_id += 1
-
-        # Random gas pipes elsewhere.
-        for i in range(N_GAS_PIPES - n_under):
-            n_pts = random.randint(4, 12)
-            x = XMIN + random.random() * WIDTH
-            y = YMIN + random.random() * HEIGHT
-            ang = random.uniform(0.0, 2.0 * math.pi)
-            seg = random.uniform(80.0, 400.0)
-            coords = []
-            for j in range(n_pts):
-                coords.append((clamp(x, XMIN + 1.0, XMAX - 1.0),
-                               clamp(y, YMIN + 1.0, YMAX - 1.0)))
-                ang += random.uniform(-0.3, 0.3)
-                x += math.cos(ang) * seg
-                y += math.sin(ang) * seg
-            polyline = make_polyline(coords, sr)
-            gc.insertRow([polyline, next_pipe_id,
-                          random.choice([60, 100, 250, 600]), "Normal"])
-            next_pipe_id += 1
-
-    # ----- Power lines: many cross roads at acute angles -----
-    next_line_id = 0
-    with arcpy.da.InsertCursor(
-            power_fc, ["SHAPE@", "LineID", "Voltage_kV", "EdgeCase"]) as pc:
-        # Acute-angle crossings: pick a road, sample a midpoint, draw a
-        # power line whose direction is within +/- 5..15 degrees of the
-        # road's local tangent.
-        n_acute = min(len(road_shapes), int(N_POWER_LINES * 0.5))
-        for i in range(n_acute):
-            road_shape = road_shapes[i % len(road_shapes)]
-            coords = _polyline_coords(road_shape)
-            if len(coords) < 2:
-                continue
-            mid_idx = len(coords) // 2
-            (x1, y1) = coords[max(0, mid_idx - 1)]
-            (x2, y2) = coords[min(len(coords) - 1, mid_idx + 1)]
-            road_ang = math.atan2(y2 - y1, x2 - x1)
-            # Acute deviation: 3 - 12 degrees.
-            dev = math.radians(random.uniform(3.0, 12.0))
-            if random.random() < 0.5:
-                dev = -dev
-            line_ang = road_ang + dev
-            mx = (x1 + x2) * 0.5
-            my = (y1 + y2) * 0.5
-            length = random.uniform(800.0, 2500.0)
-            ax = mx - math.cos(line_ang) * length * 0.5
-            ay = my - math.sin(line_ang) * length * 0.5
-            bx = mx + math.cos(line_ang) * length * 0.5
-            by = my + math.sin(line_ang) * length * 0.5
-            ax = clamp(ax, XMIN + 1.0, XMAX - 1.0)
-            ay = clamp(ay, YMIN + 1.0, YMAX - 1.0)
-            bx = clamp(bx, XMIN + 1.0, XMAX - 1.0)
-            by = clamp(by, YMIN + 1.0, YMAX - 1.0)
-            polyline = make_polyline([(ax, ay), (mx, my), (bx, by)], sr)
-            pc.insertRow([polyline, next_line_id,
-                          random.choice([69, 138, 230, 500]),
-                          "Acute_Cross"])
-            next_line_id += 1
-
-        # Background random power lines.
-        for i in range(N_POWER_LINES - n_acute):
-            x1 = XMIN + random.random() * WIDTH
-            y1 = YMIN + random.random() * HEIGHT
-            ang = random.uniform(0.0, 2.0 * math.pi)
-            length = random.uniform(500.0, 3500.0)
-            x2 = clamp(x1 + math.cos(ang) * length, XMIN + 1.0, XMAX - 1.0)
-            y2 = clamp(y1 + math.sin(ang) * length, YMIN + 1.0, YMAX - 1.0)
-            polyline = make_polyline([(x1, y1), (x2, y2)], sr)
-            pc.insertRow([polyline, next_line_id,
-                          random.choice([69, 138, 230, 500]), "Normal"])
-            next_line_id += 1
-
-    # ----- Buildings: 10,000+ tightly packed along a 1km road segment -----
-    # Pick a single road that is at least 1.2 km long; if none, fall back
-    # to a synthetic horizontal segment.
-    cluster_segment = None
-    for shp in road_shapes:
-        if shp.length >= 1200.0:
-            coords = _polyline_coords(shp)
-            if len(coords) >= 2:
-                cluster_segment = coords
-                break
-    if cluster_segment is None:
-        cy_seg = YMIN + HEIGHT * 0.5
-        cluster_segment = [
-            (XMIN + WIDTH * 0.4, cy_seg),
-            (XMIN + WIDTH * 0.5, cy_seg),  # 2km horizontal
-        ]
-
-    log("  dense building cluster anchored on a road of length ~{0:.0f} m"
-        .format(_polyline_total_length(cluster_segment)))
-
-    next_bld_id = 0
-    with arcpy.da.InsertCursor(
-            bld_fc, ["SHAPE@", "BldID", "Height_m", "EdgeCase"]) as bc:
-        # Background buildings: sparse across the bbox.
-        for i in range(N_BUILDINGS_BACKGROUND):
-            cx = XMIN + random.random() * WIDTH
-            cy = YMIN + random.random() * HEIGHT
-            w = random.uniform(8.0, 60.0)
-            h = random.uniform(8.0, 60.0)
-            polygon = make_polygon([
-                (cx - w * 0.5, cy - h * 0.5),
-                (cx + w * 0.5, cy - h * 0.5),
-                (cx + w * 0.5, cy + h * 0.5),
-                (cx - w * 0.5, cy + h * 0.5),
-                (cx - w * 0.5, cy - h * 0.5),
-            ], sr)
-            bc.insertRow([polygon, next_bld_id,
-                          random.uniform(3.0, 30.0), "Normal"])
-            next_bld_id += 1
-            if (i + 1) % 2000 == 0:
-                log("  background buildings: {0}".format(i + 1))
-
-        # Dense cluster along the chosen road.
-        positions = _sample_along_polyline(cluster_segment,
-                                            target_length=1000.0,
-                                            count=N_BUILDINGS_DENSE_CLUSTER)
-        for i, (px, py, tx, ty) in enumerate(positions):
-            # Building is a tiny rectangle offset perpendicular to the road.
-            nx, ny = -ty, tx  # perpendicular unit vector
-            offset = random.choice([-1.0, 1.0]) * random.uniform(8.0, 35.0)
-            ox = px + nx * offset
-            oy = py + ny * offset
-            w = random.uniform(4.0, 9.0)
-            h = random.uniform(4.0, 9.0)
-            # Rotate the rectangle to align with the road.
-            cos_a, sin_a = tx, ty
-            corners_local = [
-                (-w * 0.5, -h * 0.5),
-                (w * 0.5, -h * 0.5),
-                (w * 0.5, h * 0.5),
-                (-w * 0.5, h * 0.5),
-            ]
-            poly_pts = []
-            for (lx, ly) in corners_local:
-                gx = ox + lx * cos_a - ly * sin_a
-                gy = oy + lx * sin_a + ly * cos_a
-                gx = clamp(gx, XMIN + 1.0, XMAX - 1.0)
-                gy = clamp(gy, YMIN + 1.0, YMAX - 1.0)
-                poly_pts.append((gx, gy))
-            poly_pts.append(poly_pts[0])
-            polygon = make_polygon(poly_pts, sr)
-            bc.insertRow([polygon, next_bld_id,
-                          random.uniform(3.0, 12.0),
-                          "Dense_Cluster_1km"])
-            next_bld_id += 1
-            if (i + 1) % 2000 == 0:
-                log("  dense cluster buildings: {0}/{1}"
-                    .format(i + 1, N_BUILDINGS_DENSE_CLUSTER))
-
-    log("P02: complete. power_lines={0} gas_pipes={1} buildings={2}"
-        .format(next_line_id, next_pipe_id, next_bld_id))
-    return power_fc, gas_fc, bld_fc
 
 
 def _polyline_total_length(coords):
@@ -719,11 +1079,9 @@ def _polyline_total_length(coords):
 
 
 def _sample_along_polyline(coords, target_length, count):
-    """Yield ``count`` points along the first ``target_length`` meters of the
-    polyline.  Returns list of (x, y, tx, ty) where (tx, ty) is the local
-    unit tangent.
+    """Yield ``count`` (x, y, tx, ty) samples along the first
+    ``target_length`` meters of the polyline.
     """
-    # Pre-compute cumulative length.
     cum = [0.0]
     for i in range(1, len(coords)):
         x1, y1 = coords[i - 1]
@@ -734,7 +1092,6 @@ def _sample_along_polyline(coords, target_length, count):
     out = []
     for k in range(count):
         s = (k / float(max(count - 1, 1))) * use_len
-        # find segment containing s
         seg_idx = 0
         while seg_idx < len(cum) - 2 and cum[seg_idx + 1] < s:
             seg_idx += 1
@@ -748,7 +1105,8 @@ def _sample_along_polyline(coords, target_length, count):
         x2, y2 = coords[min(seg_idx + 1, len(coords) - 1)]
         px = x1 + (x2 - x1) * t
         py = y1 + (y2 - y1) * t
-        dx, dy = x2 - x1, y2 - y1
+        dx = x2 - x1
+        dy = y2 - y1
         L = math.hypot(dx, dy)
         if L < 1e-9:
             tx, ty = 1.0, 0.0
@@ -758,171 +1116,353 @@ def _sample_along_polyline(coords, target_length, count):
     return out
 
 
-
-# ===========================================================================
-# P03 / P04 - Contours + Label Candidate Boxes
-# ===========================================================================
-#
-# * Contours: a few thousand reasonable contour lines (sinusoidal terrain
-#   approximation) plus ONE colossal "Titan Ridge" line whose geometry has
-#   500,000+ vertices generated from a fractal-perturbed logarithmic
-#   spiral.  This single feature is meant to push arcpy's vertex
-#   marshalling and any in-memory copy in the contour-label optimizer to
-#   the breaking point.
-#
-# * Label_Candidate_Boxes: thousands of small axis-aligned rectangles with
-#   heavy overlap, designed to stress the numpy AABB collision logic in
-#   Plugin04_ElevationTextDeconflict.
-# ---------------------------------------------------------------------------
-
-
-def _terrain_elevation(x, y):
-    """Synthetic terrain: layered sin waves giving rolling contours."""
-    nx = (x - XMIN) / WIDTH
-    ny = (y - YMIN) / HEIGHT
-    z = (
-        300.0 * math.sin(nx * 6.28318 * 1.5)
-        + 200.0 * math.cos(ny * 6.28318 * 1.2)
-        + 120.0 * math.sin((nx + ny) * 6.28318 * 2.7)
-        + 60.0 * math.sin(nx * ny * 19.0)
-        + 1500.0
-    )
-    return z
+def _pick_city_road(trunk_endpoints):
+    """Return the trunk that spends the most length inside the plain."""
+    best_len = -1.0
+    best_coords = None
+    for coords in trunk_endpoints:
+        plain_len = 0.0
+        for i in range(1, len(coords)):
+            mx = (coords[i - 1][0] + coords[i][0]) * 0.5
+            my = (coords[i - 1][1] + coords[i][1]) * 0.5
+            if is_on_plain(mx, my):
+                plain_len += math.hypot(
+                    coords[i][0] - coords[i - 1][0],
+                    coords[i][1] - coords[i - 1][1])
+        if plain_len > best_len:
+            best_len = plain_len
+            best_coords = coords
+    return best_coords, best_len
 
 
-def _build_background_contour(idx, sr):
-    """Build a single moderately complex contour polyline."""
-    n_pts = random.randint(60, 300)
-    # Choose a base elevation in 50 m steps.
-    base_elev = round(random.uniform(900.0, 2100.0) / 50.0) * 50.0
-    # Walk along the terrain following a noisy isoline-ish path.
-    x = XMIN + random.random() * WIDTH
-    y = YMIN + random.random() * HEIGHT
-    ang = random.uniform(0.0, 2.0 * math.pi)
-    coords = []
-    for i in range(n_pts):
-        coords.append((clamp(x, XMIN + 1.0, XMAX - 1.0),
-                       clamp(y, YMIN + 1.0, YMAX - 1.0)))
-        ang += random.uniform(-0.4, 0.4)
-        step = random.uniform(20.0, 80.0)
-        x += math.cos(ang) * step
-        y += math.sin(ang) * step
-    return coords, base_elev
+def _point_distance_to_polylines(px, py, polylines, cap=200.0):
+    """Approximate distance from (px, py) to the nearest segment in any
+    of the given polyline coord lists, early-exiting if below cap."""
+    best = float("inf")
+    for coords in polylines:
+        for i in range(1, len(coords)):
+            x1, y1 = coords[i - 1]
+            x2, y2 = coords[i]
+            dx = x2 - x1
+            dy = y2 - y1
+            L2 = dx * dx + dy * dy
+            if L2 < 1e-12:
+                d = math.hypot(px - x1, py - y1)
+            else:
+                t = ((px - x1) * dx + (py - y1) * dy) / L2
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                qx = x1 + dx * t
+                qy = y1 + dy * t
+                d = math.hypot(px - qx, py - qy)
+            if d < best:
+                best = d
+                if best < cap * 0.05:
+                    return best
+    return best
 
 
-def _build_titan_ridge(n_vertices, sr):
-    """Generate a single polyline with ``n_vertices`` vertices.
+def build_stage4_megacity(gdb, sr, roads_fc, trunk_endpoints,
+                          river_polylines_coords):
+    log("STAGE 4: Megacity (Buildings + Gas + Power)")
 
-    Geometry: a logarithmic spiral, modulated by a fractal sum of sines
-    (poor man's 1D Brownian noise), then scaled to fit inside the bbox.
-    The resulting line self-approaches and curls densely - exactly the
-    kind of pathological topology that triggers worst-case behavior in
-    spatial indexes and label-placement engines.
-    """
-    cx = XMIN + WIDTH * 0.5
-    cy = YMIN + HEIGHT * 0.5
-    # Spiral parameters tuned so the radius stays inside ~9 km from center.
-    a = 1.0
-    b = 0.05
-    # Pre-generate fractal noise coefficients.
-    octaves = [
-        (1.0, 0.013),
-        (0.5, 0.041),
-        (0.25, 0.137),
-        (0.12, 0.421),
-        (0.06, 1.113),
-        (0.03, 3.371),
-    ]
-    max_radius = min(WIDTH, HEIGHT) * 0.45
-    coords = []
-    # Using append in a tight loop; this is fine in CPython 2.7 but we
-    # still keep it lean.
-    append = coords.append
-    sin = math.sin
-    cos = math.cos
-    exp = math.exp
+    # ------------------------------------------------------------------
+    # Materialize trunk + local road geometries we have on hand
+    # (trunk_endpoints already holds trunk coord lists).  We don't need
+    # to re-read the FC; trunk_endpoints is sufficient for placement.
+    # ------------------------------------------------------------------
 
-    for i in range(n_vertices):
-        theta = i * 0.0008  # ~400 radians total over 500k pts -> ~64 turns
-        r = a * exp(b * theta)
-        if r > max_radius:
-            r = max_radius
-        # Add fractal radial perturbation.
-        pert = 0.0
-        for amp, freq in octaves:
-            pert += amp * sin(theta * freq * 12.566 + i * 0.0001)
-        rr = r * (1.0 + 0.07 * pert)
-        x = cx + rr * cos(theta)
-        y = cy + rr * sin(theta)
-        # Gentle clamp; we *want* coordinates in-range without flattening
-        # the spiral structure.
-        if x < XMIN + 1.0:
-            x = XMIN + 1.0
-        elif x > XMAX - 1.0:
-            x = XMAX - 1.0
-        if y < YMIN + 1.0:
-            y = YMIN + 1.0
-        elif y > YMAX - 1.0:
-            y = YMAX - 1.0
-        append((x, y))
-    return coords
-
-
-def build_p03_p04_contours_and_labels(gdb, sr):
-    log("P03: building Contours (incl. Titan Ridge)...")
-
-    contours_fc = create_fc(
-        gdb, "Contours", "POLYLINE", sr,
+    # ------------------------------------------------------------------
+    # Buildings
+    # ------------------------------------------------------------------
+    bld_fc = create_fc(
+        gdb, "Buildings", "POLYGON", sr,
         [
-            ("ContourID", "LONG", None),
-            ("Elevation", "DOUBLE", None),
-            ("Index_Contour", "SHORT", None),
+            ("BldID", "LONG", None),
+            ("Height_m", "FLOAT", None),
             ("EdgeCase", "TEXT", 32),
         ],
     )
 
-    next_id = 0
-    with arcpy.da.InsertCursor(
-            contours_fc,
-            ["SHAPE@", "ContourID", "Elevation",
-             "Index_Contour", "EdgeCase"]) as cc:
-        # Background contours.
-        for i in range(N_CONTOURS_BACKGROUND):
-            coords, elev = _build_background_contour(next_id, sr)
+    city_road, city_len = _pick_city_road(trunk_endpoints)
+    if city_road is None or city_len < 800.0:
+        # Fallback: synthetic 2 km horizontal segment in the plain.
+        plain_cx = XMIN + PLAIN_CENTER_NORM[0] * WIDTH
+        plain_cy = YMIN + PLAIN_CENTER_NORM[1] * HEIGHT
+        city_road = [(plain_cx - 1000.0, plain_cy),
+                     (plain_cx + 1000.0, plain_cy)]
+        city_len = 2000.0
+    log("  city road (plain-resident length ~{0:.0f} m)".format(city_len))
+
+    next_bld_id = 0
+    bld_fields = ["SHAPE@", "BldID", "Height_m", "EdgeCase"]
+    with arcpy.da.InsertCursor(bld_fc, bld_fields) as bc:
+        # ----- Background: 4000 buildings scattered on the plain -----
+        log("  placing {0} background buildings (plain only)..."
+            .format(N_BUILDINGS_BACKGROUND))
+        attempts = 0
+        n_bg = 0
+        while n_bg < N_BUILDINGS_BACKGROUND and attempts < N_BUILDINGS_BACKGROUND * 8:
+            attempts += 1
+            cx_ = XMIN + random.random() * WIDTH
+            cy_ = YMIN + random.random() * HEIGHT
+            if not is_on_plain(cx_, cy_):
+                continue
+            # Reject if too close to a road (must NOT intersect roads).
+            if _point_distance_to_polylines(cx_, cy_, trunk_endpoints,
+                                            cap=80.0) < 18.0:
+                continue
+            # Reject if too close to a river.
+            if _point_distance_to_polylines(cx_, cy_, river_polylines_coords,
+                                            cap=80.0) < 20.0:
+                continue
+            w = random.uniform(8.0, 35.0)
+            h = random.uniform(8.0, 35.0)
+            poly = make_polygon([
+                (cx_ - w * 0.5, cy_ - h * 0.5),
+                (cx_ + w * 0.5, cy_ - h * 0.5),
+                (cx_ + w * 0.5, cy_ + h * 0.5),
+                (cx_ - w * 0.5, cy_ + h * 0.5),
+                (cx_ - w * 0.5, cy_ - h * 0.5),
+            ], sr)
+            bc.insertRow([poly, next_bld_id,
+                          random.uniform(3.0, 30.0), "Plain_Background"])
+            next_bld_id += 1
+            n_bg += 1
+
+        # ----- Dense cluster: 10,500 along the city road, all on plain -----
+        log("  packing {0} dense buildings along city road..."
+            .format(N_BUILDINGS_CLUSTER))
+        positions = _sample_along_polyline(
+            city_road,
+            target_length=min(1000.0, city_len),
+            count=N_BUILDINGS_CLUSTER)
+        n_cluster = 0
+        for (px, py, tx, ty) in positions:
+            # Build candidates on both sides of the road; pick first that
+            # is on plain, off-road, off-river.
+            placed = False
+            for side in (1.0, -1.0):
+                for off_amt in (16.0, 24.0, 34.0):
+                    nx_ = -ty
+                    ny_ = tx
+                    ox = px + nx_ * side * off_amt
+                    oy = py + ny_ * side * off_amt
+                    if not is_on_plain(ox, oy):
+                        continue
+                    if _point_distance_to_polylines(
+                            ox, oy, river_polylines_coords, cap=60.0) < 18.0:
+                        continue
+                    # Tight building footprint, rotated to align road.
+                    w = random.uniform(4.0, 8.0)
+                    h = random.uniform(4.0, 8.0)
+                    cos_a, sin_a = tx, ty
+                    poly_pts = []
+                    for (lx, ly) in [
+                            (-w * 0.5, -h * 0.5),
+                            (w * 0.5, -h * 0.5),
+                            (w * 0.5, h * 0.5),
+                            (-w * 0.5, h * 0.5)]:
+                        gx = ox + lx * cos_a - ly * sin_a
+                        gy = oy + lx * sin_a + ly * cos_a
+                        gx = clamp(gx, XMIN + 1.0, XMAX - 1.0)
+                        gy = clamp(gy, YMIN + 1.0, YMAX - 1.0)
+                        poly_pts.append((gx, gy))
+                    poly_pts.append(poly_pts[0])
+                    poly = make_polygon(poly_pts, sr)
+                    bc.insertRow([
+                        poly, next_bld_id,
+                        random.uniform(3.0, 12.0),
+                        "Dense_Cluster_1km",
+                    ])
+                    next_bld_id += 1
+                    n_cluster += 1
+                    placed = True
+                    break
+                if placed:
+                    break
+            if n_cluster % 2000 == 0 and n_cluster > 0:
+                log("    cluster buildings: {0}/{1}"
+                    .format(n_cluster, N_BUILDINGS_CLUSTER))
+
+    log("STAGE 4: buildings = {0} (background + cluster)"
+        .format(next_bld_id))
+
+    # ------------------------------------------------------------------
+    # Gas pipes (parallel under roads)
+    # ------------------------------------------------------------------
+    gas_fc = create_fc(
+        gdb, "Gas_Pipes", "POLYLINE", sr,
+        [
+            ("PipeID", "LONG", None),
+            ("Pressure_PSI", "SHORT", None),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+    log("  placing {0} pipes parallel under roads + {1} background..."
+        .format(N_GAS_PIPES_PARALLEL, N_GAS_PIPES_BACKGROUND))
+    next_pipe_id = 0
+    gas_fields = ["SHAPE@", "PipeID", "Pressure_PSI", "EdgeCase"]
+    with arcpy.da.InsertCursor(gas_fc, gas_fields) as gc:
+        # Parallel-under-road: copy road verbatim from a sample of trunks.
+        chosen = list(trunk_endpoints)
+        random.shuffle(chosen)
+        for k in range(min(N_GAS_PIPES_PARALLEL, len(chosen))):
+            coords = chosen[k]
+            if len(coords) < 2:
+                continue
             polyline = make_polyline(coords, sr)
-            cc.insertRow([
-                polyline, next_id, elev,
-                1 if int(elev) % 100 == 0 else 0,
-                "Normal",
+            gc.insertRow([
+                polyline, next_pipe_id,
+                random.choice([60, 100, 250, 600]),
+                "Pipe_Under_Road",
             ])
-            next_id += 1
-            if (i + 1) % 250 == 0:
-                log("  contours: {0}/{1}".format(i + 1, N_CONTOURS_BACKGROUND))
+            next_pipe_id += 1
 
-        # Titan Ridge: half-million vertices in a single feature.
-        log("  building Titan Ridge with {0} vertices...".format(
-            TITAN_RIDGE_VERTICES))
-        titan_coords = _build_titan_ridge(TITAN_RIDGE_VERTICES, sr)
-        # arcpy.Array can take a Python list of arcpy.Point.  For very
-        # large geometries we batch-construct to avoid intermediate
-        # tuple boxing surprises.
-        titan_arr = arcpy.Array()
-        add = titan_arr.add
-        for (x, y) in titan_coords:
-            add(arcpy.Point(x, y))
-        titan_polyline = arcpy.Polyline(titan_arr, sr)
-        cc.insertRow([
-            titan_polyline, next_id,
-            1850.0, 1, "Titan_Ridge",
-        ])
-        next_id += 1
-        log("  Titan Ridge inserted (length ~{0:.1f} m)".format(
-            titan_polyline.length))
+        # Background pipes outside the plain (in valleys/foothills).
+        for _ in range(N_GAS_PIPES_BACKGROUND):
+            x = XMIN + random.random() * WIDTH
+            y = YMIN + random.random() * HEIGHT
+            if is_on_plain(x, y):
+                # bias background away from the plain
+                if random.random() < 0.7:
+                    continue
+            n_pts = random.randint(4, 10)
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            seg = random.uniform(80.0, 250.0)
+            coords = []
+            for j in range(n_pts):
+                coords.append((clamp(x, XMIN + 1.0, XMAX - 1.0),
+                               clamp(y, YMIN + 1.0, YMAX - 1.0)))
+                ang += random.uniform(-0.3, 0.3)
+                x += math.cos(ang) * seg
+                y += math.sin(ang) * seg
+            polyline = make_polyline(coords, sr)
+            gc.insertRow([
+                polyline, next_pipe_id,
+                random.choice([60, 100, 250, 600]),
+                "Background",
+            ])
+            next_pipe_id += 1
+    log("  gas pipes total: {0}".format(next_pipe_id))
 
-    log("P03: contours complete.  total={0}".format(next_id))
+    # ------------------------------------------------------------------
+    # Power lines: parallel along roads + dedicated acute-cross zone
+    # ------------------------------------------------------------------
+    power_fc = create_fc(
+        gdb, "Power_Lines", "POLYLINE", sr,
+        [
+            ("LineID", "LONG", None),
+            ("Voltage_kV", "SHORT", None),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+    log("  power: {0} parallel + {1} acute + {2} background..."
+        .format(N_POWER_LINES_PARALLEL, N_POWER_LINES_ACUTE,
+                N_POWER_LINES_BACKGROUND))
+    next_line_id = 0
+    pw_fields = ["SHAPE@", "LineID", "Voltage_kV", "EdgeCase"]
+    with arcpy.da.InsertCursor(power_fc, pw_fields) as pc:
+        # Parallel-along-roads: offset the road geometry sideways by 30 m.
+        ch = list(trunk_endpoints)
+        random.shuffle(ch)
+        n_par = 0
+        for coords in ch:
+            if n_par >= N_POWER_LINES_PARALLEL:
+                break
+            if len(coords) < 2:
+                continue
+            offset = random.choice([-1.0, 1.0]) * random.uniform(20.0, 40.0)
+            offs = []
+            for i in range(len(coords)):
+                if i == 0:
+                    dx = coords[1][0] - coords[0][0]
+                    dy = coords[1][1] - coords[0][1]
+                elif i == len(coords) - 1:
+                    dx = coords[-1][0] - coords[-2][0]
+                    dy = coords[-1][1] - coords[-2][1]
+                else:
+                    dx = coords[i + 1][0] - coords[i - 1][0]
+                    dy = coords[i + 1][1] - coords[i - 1][1]
+                L = math.hypot(dx, dy)
+                if L < 1e-9:
+                    nx_, ny_ = 0.0, 0.0
+                else:
+                    nx_ = -dy / L
+                    ny_ = dx / L
+                ox = coords[i][0] + nx_ * offset
+                oy = coords[i][1] + ny_ * offset
+                offs.append((clamp(ox, XMIN + 1.0, XMAX - 1.0),
+                             clamp(oy, YMIN + 1.0, YMAX - 1.0)))
+            polyline = make_polyline(offs, sr)
+            pc.insertRow([
+                polyline, next_line_id,
+                random.choice([69, 138, 230, 500]),
+                "Parallel_To_Road",
+            ])
+            next_line_id += 1
+            n_par += 1
 
-    # ----- P04: heavily overlapping label candidate boxes -----
-    log("P04: building Label_Candidate_Boxes ({0})...".format(N_LABEL_BOXES))
+        # Acute-cross zone: dedicated patch where 400 lines cross trunks
+        # at 3..12 deg deviation from local road tangent.
+        log("  acute-cross zone...")
+        if trunk_endpoints:
+            for _ in range(N_POWER_LINES_ACUTE):
+                trunk = random.choice(trunk_endpoints)
+                if len(trunk) < 2:
+                    continue
+                mid_idx = len(trunk) // 2
+                p1 = trunk[max(0, mid_idx - 1)]
+                p2 = trunk[min(len(trunk) - 1, mid_idx + 1)]
+                road_ang = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+                dev = math.radians(random.uniform(3.0, 12.0))
+                if random.random() < 0.5:
+                    dev = -dev
+                line_ang = road_ang + dev
+                mx = (p1[0] + p2[0]) * 0.5
+                my = (p1[1] + p2[1]) * 0.5
+                length = random.uniform(800.0, 2200.0)
+                ax = clamp(mx - math.cos(line_ang) * length * 0.5,
+                           XMIN + 1.0, XMAX - 1.0)
+                ay = clamp(my - math.sin(line_ang) * length * 0.5,
+                           YMIN + 1.0, YMAX - 1.0)
+                bx = clamp(mx + math.cos(line_ang) * length * 0.5,
+                           XMIN + 1.0, XMAX - 1.0)
+                by = clamp(my + math.sin(line_ang) * length * 0.5,
+                           YMIN + 1.0, YMAX - 1.0)
+                polyline = make_polyline([(ax, ay), (mx, my), (bx, by)], sr)
+                pc.insertRow([
+                    polyline, next_line_id,
+                    random.choice([69, 138, 230, 500]),
+                    "Acute_Cross",
+                ])
+                next_line_id += 1
+
+        # Background random power lines.
+        for _ in range(N_POWER_LINES_BACKGROUND):
+            x1 = XMIN + random.random() * WIDTH
+            y1 = YMIN + random.random() * HEIGHT
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            length = random.uniform(500.0, 3000.0)
+            x2 = clamp(x1 + math.cos(ang) * length,
+                       XMIN + 1.0, XMAX - 1.0)
+            y2 = clamp(y1 + math.sin(ang) * length,
+                       YMIN + 1.0, YMAX - 1.0)
+            polyline = make_polyline([(x1, y1), (x2, y2)], sr)
+            pc.insertRow([
+                polyline, next_line_id,
+                random.choice([69, 138, 230, 500]),
+                "Background",
+            ])
+            next_line_id += 1
+    log("  power lines total: {0}".format(next_line_id))
+
+    # ------------------------------------------------------------------
+    # Label_Candidate_Boxes (P04)
+    # ------------------------------------------------------------------
+    log("  Label_Candidate_Boxes ({0})...".format(N_LABEL_BOXES))
     labels_fc = create_fc(
         gdb, "Label_Candidate_Boxes", "POLYGON", sr,
         [
@@ -932,38 +1472,34 @@ def build_p03_p04_contours_and_labels(gdb, sr):
             ("EdgeCase", "TEXT", 32),
         ],
     )
-
-    # Hot spots: 8 cluster centers where boxes pile on each other.
     cluster_centers = [
-        (XMIN + WIDTH * random.random(), YMIN + HEIGHT * random.random())
+        (XMIN + WIDTH * random.random(),
+         YMIN + HEIGHT * random.random())
         for _ in range(8)
     ]
-
     next_lab = 0
-    with arcpy.da.InsertCursor(
-            labels_fc,
-            ["SHAPE@", "LabelID", "LabelText", "Cluster", "EdgeCase"]) as lc:
+    lab_fields = ["SHAPE@", "LabelID", "LabelText", "Cluster", "EdgeCase"]
+    with arcpy.da.InsertCursor(labels_fc, lab_fields) as lc:
         for i in range(N_LABEL_BOXES):
             if random.random() < 0.65:
-                # Heavy clustering -> high overlap pressure on AABB tests.
                 ck = random.randint(0, len(cluster_centers) - 1)
                 ccx, ccy = cluster_centers[ck]
-                cx = ccx + jitter(180.0)
-                cy = ccy + jitter(120.0)
+                cx_ = ccx + jitter(180.0)
+                cy_ = ccy + jitter(120.0)
                 edge = "Cluster_Overlap"
             else:
                 ck = -1
-                cx = XMIN + random.random() * WIDTH
-                cy = YMIN + random.random() * HEIGHT
+                cx_ = XMIN + random.random() * WIDTH
+                cy_ = YMIN + random.random() * HEIGHT
                 edge = "Normal"
             w = random.uniform(40.0, 120.0)
             h = random.uniform(12.0, 28.0)
             poly = make_polygon([
-                (cx - w * 0.5, cy - h * 0.5),
-                (cx + w * 0.5, cy - h * 0.5),
-                (cx + w * 0.5, cy + h * 0.5),
-                (cx - w * 0.5, cy + h * 0.5),
-                (cx - w * 0.5, cy - h * 0.5),
+                (cx_ - w * 0.5, cy_ - h * 0.5),
+                (cx_ + w * 0.5, cy_ - h * 0.5),
+                (cx_ + w * 0.5, cy_ + h * 0.5),
+                (cx_ - w * 0.5, cy_ + h * 0.5),
+                (cx_ - w * 0.5, cy_ - h * 0.5),
             ], sr)
             lc.insertRow([
                 poly, next_lab,
@@ -971,29 +1507,177 @@ def build_p03_p04_contours_and_labels(gdb, sr):
                 ck, edge,
             ])
             next_lab += 1
-            if (i + 1) % 2000 == 0:
-                log("  labels: {0}/{1}".format(i + 1, N_LABEL_BOXES))
+    log("  label boxes: {0}".format(next_lab))
 
-    log("P04: complete. label_boxes={0}".format(next_lab))
-    return contours_fc, labels_fc
+    return bld_fc, gas_fc, power_fc, labels_fc
 
 
 
 # ===========================================================================
-# P05 - Safe Contour Cleaner (Map_Frame + Custom_AOI)
+# STAGE 5 - Geological anomalies & cartographic edges
 # ===========================================================================
 #
-# Map_Frame: a clean rectangle inset 250 m from the bbox edge.
-# Custom_AOI: a polygon whose outer ring is a sawtooth (high frequency,
-# tiny amplitude).  When contours are clipped against this AOI the
-# resulting line endings can be < 0.1 m apart, producing the microscopic
-# "sliver" artefacts the cleaner is designed to remove.
+# Springs:
+#   * scattered springs anywhere in the mountain-foot elevation band
+#   * 5 perfectly collinear springs along a steep contour (P06 SVD test)
+#   * 1 isolated spring in the SW corner
+#
+# Map_Frame: clean rectangle inset 250 m.
+# Custom_AOI: a polygon located so its sawtooth edge cuts through dense
+#   mountainous contours, generating sub-decimeter slivers when contours
+#   are clipped against it.
 # ---------------------------------------------------------------------------
 
 
-def build_p05_frame_and_aoi(gdb, sr):
-    log("P05: building Map_Frame and Custom_AOI (sawtooth slivers)...")
+def _find_steep_contour_polyline(start_search_xy, length_target=2000.0):
+    """Walk along a contour at a steep location and return the trace.
 
+    We pick a point with high slope, then take the local elevation level
+    and walk in both directions following an iso-elevation curve via a
+    "rotate gradient by 90 deg" integrator.  This is approximate but
+    yields a long line draped over a slope.
+    """
+    sx, sy = start_search_xy
+    z0 = get_elevation(sx, sy)
+    coords_fwd = [(sx, sy)]
+    coords_bwd = []
+    step = 30.0
+    for direction in (+1.0, -1.0):
+        x, y = sx, sy
+        last_dx = 0.0
+        last_dy = 0.0
+        for _ in range(int(length_target / step)):
+            gx, gy = get_gradient(x, y, h=10.0)
+            gmag = math.hypot(gx, gy)
+            if gmag < 1e-6:
+                break
+            # Tangent to contour (perpendicular to gradient).
+            tx_ = -gy / gmag * direction
+            ty_ = gx / gmag * direction
+            # Maintain rough continuity with previous step.
+            if last_dx * tx_ + last_dy * ty_ < 0.0:
+                tx_ = -tx_
+                ty_ = -ty_
+            x += tx_ * step
+            y += ty_ * step
+            if not in_bbox(x, y, pad=20.0):
+                break
+            # Snap back toward original elevation.
+            zh = get_elevation(x, y)
+            err = zh - z0
+            if abs(err) > 1.0 and gmag > 1e-6:
+                # Move along -grad/+grad to correct.
+                corr = err / gmag
+                # Cap the correction so we don't fly off.
+                if corr > 8.0:
+                    corr = 8.0
+                elif corr < -8.0:
+                    corr = -8.0
+                x -= (gx / gmag) * corr
+                y -= (gy / gmag) * corr
+            if direction > 0:
+                coords_fwd.append((x, y))
+            else:
+                coords_bwd.append((x, y))
+            last_dx, last_dy = tx_, ty_
+    coords_bwd.reverse()
+    return coords_bwd + coords_fwd
+
+
+def _find_steep_seed():
+    """Find a (x, y) with high slope (mountain flank)."""
+    best_slope = -1.0
+    best_xy = None
+    for _ in range(2000):
+        x = XMIN + random.random() * WIDTH
+        y = YMIN + random.random() * HEIGHT
+        s = get_slope(x, y)
+        if s > best_slope:
+            best_slope = s
+            best_xy = (x, y)
+            if best_slope > 0.4:
+                break
+    return best_xy
+
+
+def build_stage5_anomalies_and_edges(gdb, sr, contours_fc):
+    log("STAGE 5: Springs + Map_Frame + Custom_AOI + Grids")
+
+    # ------------------------------------------------------------------
+    # Springs
+    # ------------------------------------------------------------------
+    springs_fc = create_fc(
+        gdb, "Springs", "POINT", sr,
+        [
+            ("SpringID", "LONG", None),
+            ("Flow_LPS", "FLOAT", None),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+    next_spring = 0
+    sp_fields = ["SHAPE@", "SpringID", "Flow_LPS", "EdgeCase"]
+    with arcpy.da.InsertCursor(springs_fc, sp_fields) as sc:
+        # Random springs only at the foot of mountains (rejection sampling).
+        log("  scattering {0} springs at mountain foot..."
+            .format(N_SPRINGS_RANDOM))
+        attempts = 0
+        n_random = 0
+        while n_random < N_SPRINGS_RANDOM and \
+                attempts < N_SPRINGS_RANDOM * 30:
+            attempts += 1
+            x = XMIN + random.random() * WIDTH
+            y = YMIN + random.random() * HEIGHT
+            if not is_on_mountain_foot(x, y):
+                continue
+            sc.insertRow([
+                make_point(x, y, sr),
+                next_spring,
+                random.uniform(0.1, 50.0),
+                "Mountain_Foot",
+            ])
+            next_spring += 1
+            n_random += 1
+        log("  spring foot count: {0} (after {1} attempts)"
+            .format(n_random, attempts))
+
+        # Collinear fault line: 5 springs perfectly along a slope contour.
+        log("  injecting 5 perfectly collinear springs on a steep slope...")
+        seed = _find_steep_seed()
+        if seed is None:
+            seed = (XMIN + WIDTH * 0.3, YMIN + HEIGHT * 0.7)
+        contour_trace = _find_steep_contour_polyline(seed,
+                                                     length_target=1500.0)
+        # Pick two endpoints far enough apart along the trace and
+        # interpolate exactly 5 collinear points between them.
+        if len(contour_trace) >= 2:
+            a = contour_trace[0]
+            b = contour_trace[-1]
+        else:
+            a = (XMIN + WIDTH * 0.30, YMIN + HEIGHT * 0.70)
+            b = (XMIN + WIDTH * 0.42, YMIN + HEIGHT * 0.78)
+        for k in range(N_SPRINGS_FAULT_LINE):
+            t = k / float(N_SPRINGS_FAULT_LINE - 1)
+            # Exact double precision: same line equation for every point.
+            x = a[0] + (b[0] - a[0]) * t
+            y = a[1] + (b[1] - a[1]) * t
+            sc.insertRow([
+                make_point(x, y, sr),
+                next_spring, 12.5,
+                "Fault_Line_Collinear",
+            ])
+            next_spring += 1
+
+        # Isolated spring far from anything (SW corner).
+        sc.insertRow([
+            make_point(XMIN + 50.0, YMIN + 50.0, sr),
+            next_spring, 0.2, "Isolated",
+        ])
+        next_spring += 1
+    log("STAGE 5: springs total = {0}".format(next_spring))
+
+    # ------------------------------------------------------------------
+    # Map_Frame
+    # ------------------------------------------------------------------
     frame_fc = create_fc(
         gdb, "Map_Frame", "POLYGON", sr,
         [
@@ -1001,15 +1685,6 @@ def build_p05_frame_and_aoi(gdb, sr):
             ("Name", "TEXT", 64),
         ],
     )
-    aoi_fc = create_fc(
-        gdb, "Custom_AOI", "POLYGON", sr,
-        [
-            ("AoiID", "LONG", None),
-            ("Name", "TEXT", 64),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
-
     pad = 250.0
     frame_coords = [
         (XMIN + pad, YMIN + pad),
@@ -1022,25 +1697,40 @@ def build_p05_frame_and_aoi(gdb, sr):
             frame_fc, ["SHAPE@", "FrameID", "Name"]) as fc:
         fc.insertRow([make_polygon(frame_coords, sr), 0, "Master Frame"])
 
-    # ----- Sawtooth AOI -----
-    # Rectangle nominally inset 1 km, but every edge replaced by a high-
-    # frequency triangular sawtooth.  Tooth width ~ (edge_len / N_TEETH/4),
-    # tooth height ~ 0.05 m -> sub-decimeter slivers when clipped.
-    inset = 1000.0
-    cx_min = XMIN + inset
-    cx_max = XMAX - inset
-    cy_min = YMIN + inset
-    cy_max = YMAX - inset
+    # ------------------------------------------------------------------
+    # Custom_AOI: sawtooth edge biting into mountainous contours.
+    # Place the AOI so it covers BOTH a chunk of the plain and slices
+    # through one of the mountain peaks; the sawtooth lives along the
+    # mountain side of the polygon.
+    # ------------------------------------------------------------------
+    aoi_fc = create_fc(
+        gdb, "Custom_AOI", "POLYGON", sr,
+        [
+            ("AoiID", "LONG", None),
+            ("Name", "TEXT", 64),
+            ("EdgeCase", "TEXT", 32),
+        ],
+    )
+    # Place AOI from plain center into the NW peak (Titan Ridge area).
+    plain_cx = XMIN + PLAIN_CENTER_NORM[0] * WIDTH
+    plain_cy = YMIN + PLAIN_CENTER_NORM[1] * HEIGHT
+    nw_x = XMIN + PEAKS_NORM[0][0] * WIDTH
+    nw_y = YMIN + PEAKS_NORM[0][1] * HEIGHT
+
+    # AOI bounding rectangle: from plain center to a point past the NW peak.
+    aoi_x0 = min(plain_cx, nw_x) - 800.0
+    aoi_x1 = max(plain_cx, nw_x) + 800.0
+    aoi_y0 = min(plain_cy, nw_y) - 800.0
+    aoi_y1 = max(plain_cy, nw_y) + 800.0
+    aoi_x0 = clamp(aoi_x0, XMIN + 50.0, XMAX - 50.0)
+    aoi_x1 = clamp(aoi_x1, XMIN + 50.0, XMAX - 50.0)
+    aoi_y0 = clamp(aoi_y0, YMIN + 50.0, YMAX - 50.0)
+    aoi_y1 = clamp(aoi_y1, YMIN + 50.0, YMAX - 50.0)
 
     teeth_per_edge = max(1, N_AOI_SAWTOOTH_TEETH // 4)
     tooth_height = 0.05  # 5 cm -> microscopic slivers when clipped
 
     def sawtooth_along(start, end, n_teeth, perp_sign, axis):
-        """Return list of points along the segment with sawtooth pattern.
-
-        ``axis`` is 'x' (segment varies in x) or 'y' (varies in y);
-        ``perp_sign`` (+1/-1) chooses which side the teeth poke out.
-        """
         sx, sy = start
         ex, ey = end
         pts = []
@@ -1050,7 +1740,6 @@ def build_p05_frame_and_aoi(gdb, sr):
             for tt in (t0, t1):
                 bx = sx + (ex - sx) * tt
                 by = sy + (ey - sy) * tt
-                # Apex points are on the half-step.
                 is_apex = (tt == t1)
                 offset = tooth_height if is_apex else 0.0
                 if axis == 'x':
@@ -1061,122 +1750,35 @@ def build_p05_frame_and_aoi(gdb, sr):
 
     aoi_pts = []
     aoi_pts.extend(sawtooth_along(
-        (cx_min, cy_min), (cx_max, cy_min), teeth_per_edge,
-        perp_sign=+1, axis='x'))
+        (aoi_x0, aoi_y0), (aoi_x1, aoi_y0),
+        teeth_per_edge, perp_sign=+1, axis='x'))
     aoi_pts.extend(sawtooth_along(
-        (cx_max, cy_min), (cx_max, cy_max), teeth_per_edge,
-        perp_sign=-1, axis='y'))
+        (aoi_x1, aoi_y0), (aoi_x1, aoi_y1),
+        teeth_per_edge, perp_sign=-1, axis='y'))
     aoi_pts.extend(sawtooth_along(
-        (cx_max, cy_max), (cx_min, cy_max), teeth_per_edge,
-        perp_sign=-1, axis='x'))
+        (aoi_x1, aoi_y1), (aoi_x0, aoi_y1),
+        teeth_per_edge, perp_sign=-1, axis='x'))
     aoi_pts.extend(sawtooth_along(
-        (cx_min, cy_max), (cx_min, cy_min), teeth_per_edge,
-        perp_sign=+1, axis='y'))
+        (aoi_x0, aoi_y1), (aoi_x0, aoi_y0),
+        teeth_per_edge, perp_sign=+1, axis='y'))
     aoi_pts.append(aoi_pts[0])
-
     with arcpy.da.InsertCursor(
             aoi_fc, ["SHAPE@", "AoiID", "Name", "EdgeCase"]) as ac:
         ac.insertRow([
             make_polygon(aoi_pts, sr),
-            0, "Sawtooth AOI", "Sawtooth_Slivers",
+            0, "Sawtooth AOI (plain -> NW peak)",
+            "Sawtooth_Slivers",
         ])
-
-    log("P05: complete. AOI vertex count ~{0}".format(len(aoi_pts)))
-    return frame_fc, aoi_fc
+    log("  Custom_AOI sawtooth vertices ~{0}".format(len(aoi_pts)))
 
 
 # ===========================================================================
-# P06 - Spring Rotation (Springs)
+# STAGE 5b - Grids (P07)
 # ===========================================================================
-#
-# Edge cases:
-#   * Random scattered springs (typical workload).
-#   * One "Fault Line" of EXACTLY 5 perfectly collinear springs - this is
-#     the configuration that yields a singular covariance matrix and
-#     causes naive SVD-based principal-axis fitting to fail (or warn
-#     about degenerate singular values).
-#   * One "Isolated Spring" placed > 2 km from any other point, so it
-#     sits well outside the contour neighborhood.
-# ---------------------------------------------------------------------------
 
 
-def build_p06_springs(gdb, sr):
-    log("P06: building Springs...")
-    springs_fc = create_fc(
-        gdb, "Springs", "POINT", sr,
-        [
-            ("SpringID", "LONG", None),
-            ("Flow_LPS", "FLOAT", None),
-            ("EdgeCase", "TEXT", 32),
-        ],
-    )
-
-    next_id = 0
-    with arcpy.da.InsertCursor(
-            springs_fc,
-            ["SHAPE@", "SpringID", "Flow_LPS", "EdgeCase"]) as sc:
-        for i in range(N_SPRINGS_RANDOM):
-            x = XMIN + random.random() * WIDTH
-            y = YMIN + random.random() * HEIGHT
-            sc.insertRow([
-                make_point(x, y, sr),
-                next_id, random.uniform(0.1, 50.0), "Normal",
-            ])
-            next_id += 1
-
-        # Perfectly collinear fault line (SVD singular trigger).
-        fx0 = XMIN + WIDTH * 0.25
-        fy0 = YMIN + HEIGHT * 0.25
-        fx1 = XMIN + WIDTH * 0.75
-        fy1 = YMIN + HEIGHT * 0.75
-        for k in range(N_SPRINGS_FAULT_LINE):
-            t = k / float(N_SPRINGS_FAULT_LINE - 1)
-            # Use exact double arithmetic without any jitter.
-            x = fx0 + (fx1 - fx0) * t
-            y = fy0 + (fy1 - fy0) * t
-            sc.insertRow([
-                make_point(x, y, sr),
-                next_id, 12.5, "Fault_Line_Collinear",
-            ])
-            next_id += 1
-
-        # Isolated spring far from contour mass.
-        iso_x = XMIN + 50.0   # tucked into the SW corner
-        iso_y = YMIN + 50.0
-        sc.insertRow([
-            make_point(iso_x, iso_y, sr),
-            next_id, 0.2, "Isolated",
-        ])
-        next_id += 1
-
-    log("P06: complete. springs={0} (incl. {1} collinear + 1 isolated)"
-        .format(next_id, N_SPRINGS_FAULT_LINE))
-    return springs_fc
-
-
-
-# ===========================================================================
-# P07 - Batch Grid Builder (Index_Grid + GCS_Grid + HUGE_Grid)
-# ===========================================================================
-#
-# We emit three grid feature classes:
-#
-#   * Index_Grid   - normal projected grid, valid input.
-#   * GCS_Grid     - polygons in WGS84 lat/lon, intended to make the grid
-#                    builder warn about a Geographic CS being unsuitable
-#                    for distance/area calculations.
-#   * HUGE_Grid_Sparse - tile cells whose row/col indices imply an axis
-#                        tick count of HUGE_GRID_TICKS, exceeding any
-#                        reasonable MAX_TICKS_PER_AXIS safety cap.  We do
-#                        NOT actually emit HUGE_GRID_TICKS^2 polygons (that
-#                        would be 36 million); we emit a sparse subset
-#                        covering the same row/col index range so the
-#                        cap-detection logic can read the implied extent.
-# ---------------------------------------------------------------------------
-
-
-def build_p07_grids(gdb, projected_sr, geographic_sr):
-    log("P07: building Index_Grid (projected)...")
+def build_stage5_grids(gdb, projected_sr, geographic_sr):
+    log("  P07: Index_Grid (projected)...")
     grid_fc = create_fc(
         gdb, "Index_Grid", "POLYGON", projected_sr,
         [
@@ -1191,7 +1793,8 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
     cell_h = HEIGHT / float(NORMAL_GRID_ROWS)
     next_id = 0
     with arcpy.da.InsertCursor(
-            grid_fc, ["SHAPE@", "GridID", "Row", "Col", "Label", "EdgeCase"]) as gc:
+            grid_fc,
+            ["SHAPE@", "GridID", "Row", "Col", "Label", "EdgeCase"]) as gc:
         for r in range(NORMAL_GRID_ROWS):
             for c in range(NORMAL_GRID_COLS):
                 x0 = XMIN + c * cell_w
@@ -1206,10 +1809,8 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
                     "{0}-{1}".format(r, c), "Normal",
                 ])
                 next_id += 1
-    log("  Index_Grid cells: {0}".format(next_id))
 
-    # ---- GCS grid: should trigger "GCS not recommended" warning ----
-    log("P07: building GCS_Grid (WGS84 lat/lon, GCS warning trigger)...")
+    log("  P07: GCS_Grid (WGS84, GCS-warning trigger)...")
     gcs_fc = create_fc(
         gdb, "GCS_Grid", "POLYGON", geographic_sr,
         [
@@ -1219,8 +1820,6 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
             ("EdgeCase", "TEXT", 32),
         ],
     )
-    # Pick a small lon/lat window roughly corresponding to UTM zone 11N
-    # mid-latitudes; exact location doesn't matter, only the SR does.
     lon_min, lon_max = -116.0, -115.5
     lat_min, lat_max = 35.0, 35.5
     dlon = (lon_max - lon_min) / float(GCS_GRID_COLS)
@@ -1241,10 +1840,8 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
                     poly, next_gcs, r, c, "GCS_Warning",
                 ])
                 next_gcs += 1
-    log("  GCS_Grid cells: {0}".format(next_gcs))
 
-    # ---- HUGE grid: spans HUGE_GRID_TICKS x HUGE_GRID_TICKS index space ----
-    log("P07: building HUGE_Grid_Sparse (MAX_TICKS_PER_AXIS trigger)...")
+    log("  P07: HUGE_Grid_Sparse (MAX_TICKS_PER_AXIS trigger)...")
     huge_fc = create_fc(
         gdb, "HUGE_Grid_Sparse", "POLYGON", projected_sr,
         [
@@ -1259,9 +1856,6 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
     huge_cell_w = WIDTH / float(HUGE_GRID_TICKS)
     huge_cell_h = HEIGHT / float(HUGE_GRID_TICKS)
     next_huge = 0
-
-    # Emit anchor cells at corners and a random sparse sample so the
-    # bounding extent of the grid implies HUGE_GRID_TICKS ticks per axis.
     anchor_rc = [
         (0, 0),
         (0, HUGE_GRID_TICKS - 1),
@@ -1304,12 +1898,10 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
             ])
             next_huge += 1
             if next_huge % 25000 == 0:
-                log("  huge grid sparse cells: {0}/{1}"
+                log("    HUGE sparse cells: {0}/{1}"
                     .format(next_huge, HUGE_GRID_SAMPLE_LIMIT))
-
-    log("P07: complete. index_grid={0} gcs_grid={1} huge_sparse={2}"
+    log("  P07 complete: index={0} gcs={1} huge={2}"
         .format(next_id, next_gcs, next_huge))
-    return grid_fc, gcs_fc, huge_fc
 
 
 # ===========================================================================
@@ -1319,7 +1911,7 @@ def build_p07_grids(gdb, projected_sr, geographic_sr):
 
 def main():
     out_dir = resolve_output_dir()
-    log("Titan World generator starting.")
+    log("Titan World 2.0 generator starting (topologically dependent).")
     log("Output dir: {0}".format(out_dir))
     log("Random seed: {0}".format(RANDOM_SEED))
 
@@ -1329,25 +1921,28 @@ def main():
     projected_sr = get_projected_sr()
     geographic_sr = get_geographic_sr()
 
-    # P01
-    roads_fc, _ = build_p01_roads_and_rivers(gdb_path, projected_sr)
+    # STAGE 1: Terrain Foundation
+    _, contours_fc = build_stage1_terrain(gdb_path, projected_sr)
 
-    # P02 (depends on P01 roads for cluster + pipe-under-road).
-    build_p02_power_gas_buildings(gdb_path, projected_sr, roads_fc)
+    # STAGE 2: Hydrology (depends on STAGE 1 oracle)
+    _, river_polylines_coords, river_vertex_pool, river_segment_pool = \
+        build_stage2_hydrology(gdb_path, projected_sr)
 
-    # P03 + P04
-    build_p03_p04_contours_and_labels(gdb_path, projected_sr)
+    # STAGE 3: Roads (depends on STAGE 1 slope + STAGE 2 rivers)
+    roads_fc, trunk_endpoints = build_stage3_roads(
+        gdb_path, projected_sr, river_polylines_coords,
+        river_vertex_pool, river_segment_pool)
 
-    # P05
-    build_p05_frame_and_aoi(gdb_path, projected_sr)
+    # STAGE 4: Megacity (depends on STAGE 3 roads + STAGE 2 rivers + plain)
+    build_stage4_megacity(
+        gdb_path, projected_sr, roads_fc, trunk_endpoints,
+        river_polylines_coords)
 
-    # P06
-    build_p06_springs(gdb_path, projected_sr)
+    # STAGE 5: Anomalies & cartographic edges
+    build_stage5_anomalies_and_edges(gdb_path, projected_sr, contours_fc)
+    build_stage5_grids(gdb_path, projected_sr, geographic_sr)
 
-    # P07
-    build_p07_grids(gdb_path, projected_sr, geographic_sr)
-
-    log("Titan World generation complete.")
+    log("Titan World 2.0 generation complete.")
     log("Geodatabase: {0}".format(gdb_path))
 
 
@@ -1355,7 +1950,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        # Surface the full traceback both to ArcMap and stderr.
         import traceback
         tb = traceback.format_exc()
         try:
