@@ -1100,192 +1100,287 @@ class BatchGridBuilder07:
 
         # Mode + sources
         p_mode = arcpy.Parameter(
-            "Mode", "mode", "GPString", "Required", "Input")
+            displayName="Mode",
+            name="mode",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
         p_mode.filter.type = "ValueList"
         p_mode.filter.list = ["FOLDER_OF_APRX", "AOI_LAYER_IN_CURRENT_PROJECT"]
         p_mode.value = "FOLDER_OF_APRX"
         p.append(p_mode)
 
         p_pfold = arcpy.Parameter(
-            "APRX Folder (Mode=FOLDER_OF_APRX)", "aprx_folder",
-            "DEFolder", "Optional", "Input")
+            displayName="APRX Folder (Mode=FOLDER_OF_APRX)",
+            name="aprx_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_pfold)
 
         p_rec = arcpy.Parameter(
-            "Include Subfolders", "recursive",
-            "GPBoolean", "Optional", "Input")
+            displayName="Include Subfolders",
+            name="recursive",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_rec.value = False
         p.append(p_rec)
 
         p_lyt = arcpy.Parameter(
-            "Layout Name (optional; default=first layout)", "layout_name",
-            "GPString", "Optional", "Input")
+            displayName="Layout Name (optional; default=first layout)",
+            name="layout_name",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_lyt)
 
         p_aoi = arcpy.Parameter(
-            "AOI Layer (Mode=AOI_LAYER_IN_CURRENT_PROJECT)", "aoi_layer",
-            "GPFeatureLayer", "Optional", "Input")
+            displayName="AOI Layer (Mode=AOI_LAYER_IN_CURRENT_PROJECT)",
+            name="aoi_layer",
+            datatype="GPFeatureLayer",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_aoi)
 
         p_aoi_nf = arcpy.Parameter(
-            "AOI Name Field", "aoi_name_field",
-            "Field", "Optional", "Input")
+            displayName="AOI Name Field",
+            name="aoi_name_field",
+            datatype="Field",
+            parameterType="Optional",
+            direction="Input")
         p_aoi_nf.parameterDependencies = [p_aoi.name]
         p.append(p_aoi_nf)
 
         p_eng = arcpy.Parameter(
-            "Engine", "engine", "GPString", "Required", "Input")
+            displayName="Engine",
+            name="engine",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
         p_eng.filter.type = "ValueList"
         p_eng.filter.list = ["SMART_FEATURE", "ESRI_XML"]
         p_eng.value = "SMART_FEATURE"
         p.append(p_eng)
 
         p_xml = arcpy.Parameter(
-            "Grid Template XML (Engine=ESRI_XML)", "grid_xml",
-            "DEFile", "Optional", "Input")
+            displayName="Grid Template XML (Engine=ESRI_XML)",
+            name="grid_xml",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
         p_xml.filter.list = ["xml"]
         p.append(p_xml)
 
         p_ows = arcpy.Parameter(
-            "Output Workspace (.gdb or folder)", "out_ws",
-            "DEWorkspace", "Required", "Input")
+            displayName="Output Workspace (.gdb or folder)",
+            name="out_ws",
+            datatype="DEWorkspace",
+            parameterType="Required",
+            direction="Input")
         p.append(p_ows)
 
         p_fds = arcpy.Parameter(
-            "Feature Dataset Name (for SMART_FEATURE outputs)", "fds_name",
-            "GPString", "Optional", "Input")
+            displayName="Feature Dataset Name (for SMART_FEATURE outputs)",
+            name="fds_name",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
         p_fds.value = "Grids"
         p.append(p_fds)
 
         p_rs = arcpy.Parameter(
-            "Reference Scale Denominator (e.g., 25000)", "refscale_denom",
-            "GPDouble", "Required", "Input")
+            displayName="Reference Scale Denominator (e.g., 25000)",
+            name="refscale_denom",
+            datatype="GPDouble",
+            parameterType="Required",
+            direction="Input")
         p_rs.value = 25000
         p.append(p_rs)
 
         p_rot = arcpy.Parameter(
-            "(SMART_FEATURE) Respect Map Frame Rotation",
-            "respect_df_rotation", "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Respect Map Frame Rotation",
+            name="respect_df_rotation",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_rot.value = True
         p.append(p_rot)
 
         p_sp = arcpy.Parameter(
-            "(SMART_FEATURE) Projected Interval (map units)", "spacing_proj",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Projected Interval (map units)",
+            name="spacing_proj",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_sp.value = 1000.0
         p.append(p_sp)
 
         p_dv = arcpy.Parameter(
-            "(SMART_FEATURE) Projected Label Divisor "
+            displayName="(SMART_FEATURE) Projected Label Divisor "
             "(1000 => 295 instead of 295000)",
-            "divisor_proj", "GPDouble", "Optional", "Input")
+            name="divisor_proj",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_dv.value = 1000.0
         p.append(p_dv)
 
         p_tk = arcpy.Parameter(
-            "(SMART_FEATURE) Tick Length (mm)", "tick_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Tick Length (mm)",
+            name="tick_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_tk.value = 1.5
         p.append(p_tk)
 
         p_lb = arcpy.Parameter(
-            "(SMART_FEATURE) Label Offset (mm)", "label_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Label Offset (mm)",
+            name="label_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_lb.value = 3.0
         p.append(p_lb)
 
         p_gl = arcpy.Parameter(
-            "(SMART_FEATURE) Create Grid Lines (full)", "create_grid_lines",
-            "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Create Grid Lines (full)",
+            name="create_grid_lines",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_gl.value = True
         p.append(p_gl)
 
         p_lm = arcpy.Parameter(
-            "(SMART_FEATURE) Projected Label Format", "proj_label_mode",
-            "GPString", "Optional", "Input")
+            displayName="(SMART_FEATURE) Projected Label Format",
+            name="proj_label_mode",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
         p_lm.filter.type = "ValueList"
         p_lm.filter.list = ["INT", "FLOAT"]
         p_lm.value = "INT"
         p.append(p_lm)
 
         p_us = arcpy.Parameter(
-            "(SMART_FEATURE) Projected Label Unit Suffix", "proj_unit_suffix",
-            "GPString", "Optional", "Input")
+            displayName="(SMART_FEATURE) Projected Label Unit Suffix",
+            name="proj_unit_suffix",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
         p_us.value = ""
         p.append(p_us)
 
         p_pd = arcpy.Parameter(
-            "(SMART_FEATURE) Projected Label Pad to 3 digits", "proj_pad3",
-            "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Projected Label Pad to 3 digits",
+            name="proj_pad3",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_pd.value = True
         p.append(p_pd)
 
         p_eg = arcpy.Parameter(
-            "(SMART_FEATURE) Enable Graticule (Lat/Lon)", "enable_graticule",
-            "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Enable Graticule (Lat/Lon)",
+            name="enable_graticule",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_eg.value = True
         p.append(p_eg)
 
         p_gm = arcpy.Parameter(
-            "(SMART_FEATURE) Graticule Interval (minutes)", "grat_minutes",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Graticule Interval (minutes)",
+            name="grat_minutes",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_gm.value = 2.5
         p.append(p_gm)
 
         p_gmd = arcpy.Parameter(
-            "(SMART_FEATURE) Graticule Mode", "grat_mode",
-            "GPString", "Optional", "Input")
+            displayName="(SMART_FEATURE) Graticule Mode",
+            name="grat_mode",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
         p_gmd.filter.type = "ValueList"
         p_gmd.filter.list = ["TRUE_INTERVAL", "SAMPLE_AT_PROJECTED_TICKS"]
         p_gmd.value = "TRUE_INTERVAL"
         p.append(p_gmd)
 
         p_gw = arcpy.Parameter(
-            "(SMART_FEATURE) Geographic WKID for Graticule", "geo_wkid",
-            "GPLong", "Optional", "Input")
+            displayName="(SMART_FEATURE) Geographic WKID for Graticule",
+            name="geo_wkid",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input")
         p_gw.value = 4326
         p.append(p_gw)
 
         p_glm = arcpy.Parameter(
-            "(SMART_FEATURE) Graticule Label Offset (mm)", "grat_label_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Graticule Label Offset (mm)",
+            name="grat_label_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_glm.value = 3.5
         p.append(p_glm)
 
         p_gh = arcpy.Parameter(
-            "(SMART_FEATURE) Show Hemisphere (N/S/E/W)", "grat_hemi",
-            "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Show Hemisphere (N/S/E/W)",
+            name="grat_hemi",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_gh.value = False
         p.append(p_gh)
 
         p_do = arcpy.Parameter(
-            "(SMART_FEATURE) Auto De-overlap at Corners", "deoverlap_corners",
-            "GPBoolean", "Optional", "Input")
+            displayName="(SMART_FEATURE) Auto De-overlap at Corners",
+            name="deoverlap_corners",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_do.value = True
         p.append(p_do)
 
         p_ms = arcpy.Parameter(
-            "(SMART_FEATURE) Minimum Separation (mm)", "min_sep_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Minimum Separation (mm)",
+            name="min_sep_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_ms.value = 1.5
         p.append(p_ms)
 
         p_ce = arcpy.Parameter(
-            "(SMART_FEATURE) Corner Extra Shift (mm)", "corner_extra_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(SMART_FEATURE) Corner Extra Shift (mm)",
+            name="corner_extra_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_ce.value = 1.0
         p.append(p_ce)
 
         p_co = arcpy.Parameter(
-            "Continue On Error (best-effort batch)", "continue_on_error",
-            "GPBoolean", "Optional", "Input")
+            displayName="Continue On Error (best-effort batch)",
+            name="continue_on_error",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_co.value = True
         p.append(p_co)
 
         # F1: MAX_TICKS_PER_AXIS - default 5000 per the master rules.
         p_mt = arcpy.Parameter(
-            "Max Ticks Per Axis (safety cap; SMART_FEATURE)",
-            "max_ticks_per_axis", "GPLong", "Optional", "Input")
+            displayName="Max Ticks Per Axis (safety cap; SMART_FEATURE)",
+            name="max_ticks_per_axis",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input")
         p_mt.value = 5000
         p_mt.description = (
             "SMART_FEATURE: if the projected (or graticule) tick count on "
@@ -1295,102 +1390,152 @@ class BatchGridBuilder07:
         p.append(p_mt)
 
         p_cl = arcpy.Parameter(
-            "Clean old grids for sheet before creating new", "cleanup_sheet",
-            "GPBoolean", "Optional", "Input")
+            displayName="Clean old grids for sheet before creating new",
+            name="cleanup_sheet",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_cl.value = True
         p.append(p_cl)
 
         p_dr = arcpy.Parameter(
-            "Dry Run (no outputs written)", "dry_run",
-            "GPBoolean", "Optional", "Input")
+            displayName="Dry Run (no outputs written)",
+            name="dry_run",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_dr.value = False
         p.append(p_dr)
 
         p_sym = arcpy.Parameter(
-            "Apply Symbology From Layerfile (optional)",
-            "symbology_layerfile",
-            "DEFile", "Optional", "Input")
+            displayName="Apply Symbology From Layerfile (optional)",
+            name="symbology_layerfile",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
         p_sym.filter.list = ["lyr", "lyrx"]
         p.append(p_sym)
 
         p_msk = arcpy.Parameter(
-            "(ESRI_XML) Mask Size (mm)", "mask_mm",
-            "GPDouble", "Optional", "Input")
+            displayName="(ESRI_XML) Mask Size (mm)",
+            name="mask_mm",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_msk.value = 5.0
         p.append(p_msk)
 
         p_af = arcpy.Parameter(
-            "(ESRI_XML) XML AutoFix (best-effort)", "xml_autofix",
-            "GPBoolean", "Optional", "Input")
+            displayName="(ESRI_XML) XML AutoFix (best-effort)",
+            name="xml_autofix",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_af.value = True
         p.append(p_af)
 
         p_da = arcpy.Parameter(
-            "(ESRI_XML) Ancillary Offset Delta", "xml_delta_anc",
-            "GPDouble", "Optional", "Input")
+            displayName="(ESRI_XML) Ancillary Offset Delta",
+            name="xml_delta_anc",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input")
         p_da.value = 2.0
         p.append(p_da)
 
         p_atm = arcpy.Parameter(
-            "Add outputs to current map", "add_to_map",
-            "GPBoolean", "Optional", "Input")
+            displayName="Add outputs to current map",
+            name="add_to_map",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_atm.value = True
         p.append(p_atm)
 
         p_smc = arcpy.Parameter(
-            "Save APRX copy (Mode=FOLDER_OF_APRX)", "save_aprx_copy",
-            "GPBoolean", "Optional", "Input")
+            displayName="Save APRX copy (Mode=FOLDER_OF_APRX)",
+            name="save_aprx_copy",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_smc.value = True
         p.append(p_smc)
 
         p_omf = arcpy.Parameter(
-            "Output APRX Folder", "out_aprx_folder",
-            "DEFolder", "Optional", "Input")
+            displayName="Output APRX Folder",
+            name="out_aprx_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_omf)
 
         p_epd = arcpy.Parameter(
-            "Export PDF", "export_pdf",
-            "GPBoolean", "Optional", "Input")
+            displayName="Export PDF",
+            name="export_pdf",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_epd.value = False
         p.append(p_epd)
 
         p_opd = arcpy.Parameter(
-            "Output PDF Folder", "out_pdf_folder",
-            "DEFolder", "Optional", "Input")
+            displayName="Output PDF Folder",
+            name="out_pdf_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_opd)
 
         p_pdpi = arcpy.Parameter(
-            "PDF Resolution (DPI)", "pdf_dpi",
-            "GPLong", "Optional", "Input")
+            displayName="PDF Resolution (DPI)",
+            name="pdf_dpi",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input")
         p_pdpi.value = 300
         p.append(p_pdpi)
 
         p_epng = arcpy.Parameter(
-            "Export PNG", "export_png",
-            "GPBoolean", "Optional", "Input")
+            displayName="Export PNG",
+            name="export_png",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_epng.value = False
         p.append(p_epng)
 
         p_ejpg = arcpy.Parameter(
-            "Export JPEG", "export_jpeg",
-            "GPBoolean", "Optional", "Input")
+            displayName="Export JPEG",
+            name="export_jpeg",
+            datatype="GPBoolean",
+            parameterType="Optional",
+            direction="Input")
         p_ejpg.value = False
         p.append(p_ejpg)
 
         p_oimg = arcpy.Parameter(
-            "Output Image Folder (PNG/JPEG)", "out_img_folder",
-            "DEFolder", "Optional", "Input")
+            displayName="Output Image Folder (PNG/JPEG)",
+            name="out_img_folder",
+            datatype="DEFolder",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_oimg)
 
         p_idpi = arcpy.Parameter(
-            "Image Resolution (DPI)", "img_dpi",
-            "GPLong", "Optional", "Input")
+            displayName="Image Resolution (DPI)",
+            name="img_dpi",
+            datatype="GPLong",
+            parameterType="Optional",
+            direction="Input")
         p_idpi.value = 300
         p.append(p_idpi)
 
         p_log = arcpy.Parameter(
-            "Log file (optional)", "log_file",
-            "DEFile", "Optional", "Input")
+            displayName="Log file (optional)",
+            name="log_file",
+            datatype="DEFile",
+            parameterType="Optional",
+            direction="Input")
         p.append(p_log)
 
         return p
