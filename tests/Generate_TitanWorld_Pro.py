@@ -684,7 +684,10 @@ def _trace_stream(start_x: float, start_y: float,
 
 
 def build_stage2_hydrology(gdb: str) -> None:
-    log("[Stage 2] Building Drainage (rivers descend the gradient)")
+    log("[Stage 2] Building Drainage + named hydrology layers "
+        "(River_L / Seasonal_River_L / Canal / Abreez)")
+
+    # Legacy aggregate layer (kept for backward compatibility with v2 workflows).
     drainage_fc = create_fc(
         "Drainage", "POLYLINE",
         fields=(
@@ -692,6 +695,37 @@ def build_stage2_hydrology(gdb: str) -> None:
             ("StreamType", "TEXT", 24),
             ("HeadElev_M", "DOUBLE", 0),
         ),
+    )
+
+    # ----- Named hydrology layers (v3): mirrors the project map sample ----
+    # River_L           : main perennial channels (head elev > 1500 m).
+    # Seasonal_River_L  : intermittent streams (head elev 1200-1500 m).
+    # Abreez            : ephemeral wash / arroyo (head elev < 1200 m).
+    # Canal             : low-slope plain channels carved straight along
+    #                     primary plain ridges -- emitted procedurally.
+    river_fc = create_fc(
+        "River_L", "POLYLINE",
+        fields=(("RiverID", "LONG", 0),
+                ("Name", "TEXT", 48),
+                ("HeadElev_M", "DOUBLE", 0)),
+    )
+    season_fc = create_fc(
+        "Seasonal_River_L", "POLYLINE",
+        fields=(("StreamID", "LONG", 0),
+                ("Name", "TEXT", 48),
+                ("HeadElev_M", "DOUBLE", 0)),
+    )
+    abreez_fc = create_fc(
+        "Abreez", "POLYLINE",
+        fields=(("AbreezID", "LONG", 0),
+                ("Name", "TEXT", 48),
+                ("HeadElev_M", "DOUBLE", 0)),
+    )
+    canal_fc = create_fc(
+        "Canal", "POLYLINE",
+        fields=(("CanalID", "LONG", 0),
+                ("Name", "TEXT", 48),
+                ("Width_M", "FLOAT", 0)),
     )
 
     seeds: List[Tuple[float, float]] = []
@@ -707,24 +741,88 @@ def build_stage2_hydrology(gdb: str) -> None:
     seeds = seeds[:DRAINAGE_STREAMS]
     log(f"  Tracing {len(seeds)} streams from peak rings")
 
-    did = 0
+    did = riv_id = sea_id = abr_id = 0
     paths: List[List[Tuple[float, float]]] = []
-    with arcpy.da.InsertCursor(
-            drainage_fc,
-            ["SHAPE@", "DrainID", "StreamType", "HeadElev_M"]) as cur:
+    drainage_cur = arcpy.da.InsertCursor(
+        drainage_fc, ["SHAPE@", "DrainID", "StreamType", "HeadElev_M"])
+    river_cur = arcpy.da.InsertCursor(
+        river_fc, ["SHAPE@", "RiverID", "Name", "HeadElev_M"])
+    season_cur = arcpy.da.InsertCursor(
+        season_fc, ["SHAPE@", "StreamID", "Name", "HeadElev_M"])
+    abreez_cur = arcpy.da.InsertCursor(
+        abreez_fc, ["SHAPE@", "AbreezID", "Name", "HeadElev_M"])
+    try:
         for sx, sy in seeds:
             path = _trace_stream(sx, sy)
             if len(path) < 8:
                 continue
             head_elev = get_elevation(path[0][0], path[0][1])
-            stype = ("RIVER" if head_elev > 1500
-                     else "STREAM" if head_elev > 1200
-                     else "CREEK")
-            cur.insertRow([make_polyline(path), did, stype, head_elev])
+            shape = make_polyline(path)
+            if head_elev > 1500.0:
+                stype = "RIVER"
+                river_cur.insertRow([
+                    shape, riv_id, f"River_{riv_id:03d}", head_elev,
+                ])
+                riv_id += 1
+            elif head_elev > 1200.0:
+                stype = "STREAM"
+                season_cur.insertRow([
+                    shape, sea_id, f"Seasonal_{sea_id:03d}", head_elev,
+                ])
+                sea_id += 1
+            else:
+                stype = "CREEK"
+                abreez_cur.insertRow([
+                    shape, abr_id, f"Abreez_{abr_id:03d}", head_elev,
+                ])
+                abr_id += 1
+            drainage_cur.insertRow([shape, did, stype, head_elev])
             paths.append(path)
             did += 1
+    finally:
+        del drainage_cur, river_cur, season_cur, abreez_cur
 
-    log(f"  Inserted {did} drainage features")
+    # ----- Canals: straight engineered channels along the plain edges ----
+    # We emit one canal per primary axis offset from the plain center to
+    # provide low-slope linear water features that stay on the plain.
+    log("  Inserting engineered canals across the plain")
+    canal_count = 0
+    with arcpy.da.InsertCursor(
+            canal_fc, ["SHAPE@", "CanalID", "Name", "Width_M"]) as cur:
+        n_canals = 4
+        for k in range(n_canals):
+            ang = math.pi * (k / n_canals) + math.radians(15.0)
+            cx, cy = PLAIN_CENTER
+            half_len = 0.45 * min(WIDTH, HEIGHT)
+            x0 = clamp(cx - half_len * math.cos(ang),
+                       X_MIN + 200, X_MAX - 200)
+            y0 = clamp(cy - half_len * math.sin(ang),
+                       Y_MIN + 200, Y_MAX - 200)
+            x1 = clamp(cx + half_len * math.cos(ang),
+                       X_MIN + 200, X_MAX - 200)
+            y1 = clamp(cy + half_len * math.sin(ang),
+                       Y_MIN + 200, Y_MAX - 200)
+            steps = 80
+            coords = []
+            for s in range(steps + 1):
+                t = s / steps
+                x = lerp(x0, x1, t)
+                y = lerp(y0, y1, t)
+                # Only emit canal vertices that sit on the low-slope plain.
+                if get_elevation(x, y) <= PLAIN_MAX_ELEV + 30:
+                    coords.append((x, y))
+            if len(coords) >= 4:
+                cur.insertRow([
+                    make_polyline(coords),
+                    canal_count, f"Canal_{canal_count:02d}",
+                    random.uniform(3.0, 8.0),
+                ])
+                # Canals also act as "rivers" for road bridge alignment.
+                paths.append(coords)
+                canal_count += 1
+
+    log(f"  Inserted {did} drainage / {riv_id} River_L / {sea_id} "
+        f"Seasonal_River_L / {abr_id} Abreez / {canal_count} Canal features")
     RIVER_PATHS.extend(paths)
 
 
@@ -956,8 +1054,10 @@ def _inject_t_and_overlap(roads: List[List[Tuple[float, float]]],
 
 
 def build_stage3_roads(gdb: str) -> None:
-    log("[Stage 3] Building Roads on the plain with logical river bridges")
+    log("[Stage 3] Building Roads + named layers (Freeway/Highway/Parkway/"
+        "Asphalt_Road/Gravel) with logical river bridges")
 
+    # Aggregate / generic Roads layer (kept for v2 callers).
     roads_fc = create_fc(
         "Roads", "POLYLINE",
         fields=(
@@ -965,6 +1065,48 @@ def build_stage3_roads(gdb: str) -> None:
             ("RoadClass", "TEXT", 32),
             ("Origin", "TEXT", 24),
         ),
+    )
+
+    # ----- Named v3 road class layers ------------------------------------
+    freeway_fc = create_fc(
+        "Freeway", "POLYLINE",
+        fields=(("FwyID", "LONG", 0),
+                ("Name", "TEXT", 32),
+                ("HasTrueCurve", "SHORT", 0)),
+    )
+    highway_fc = create_fc(
+        "Highway", "POLYLINE",
+        fields=(("HwyID", "LONG", 0),
+                ("Name", "TEXT", 32),
+                ("HasTrueCurve", "SHORT", 0)),
+    )
+    parkway_fc = create_fc(
+        "Parkway", "POLYLINE",
+        fields=(("PkwyID", "LONG", 0),
+                ("Name", "TEXT", 32),
+                ("Switchback", "SHORT", 0)),
+    )
+    asphalt_fc = create_fc(
+        "Asphalt_Road", "POLYLINE",
+        fields=(("RoadID", "LONG", 0), ("Name", "TEXT", 32)),
+    )
+    gravel_fc = create_fc(
+        "Gravel", "POLYLINE",
+        fields=(("RoadID", "LONG", 0), ("Name", "TEXT", 32)),
+    )
+
+    # Point layers seeded at river crossings.
+    bridge_fc = create_fc(
+        "Bridge_P", "POINT",
+        fields=(("BridgeID", "LONG", 0),
+                ("RoadClass", "TEXT", 24),
+                ("RiverIdx", "LONG", 0)),
+    )
+    culvert_fc = create_fc(
+        "Culvert_Pnt", "POINT",
+        fields=(("CulvertID", "LONG", 0),
+                ("RoadClass", "TEXT", 24),
+                ("RiverIdx", "LONG", 0)),
     )
 
     log(f"  Building {ROAD_PRIMARY_COUNT} primary arterials")
@@ -1020,12 +1162,245 @@ def build_stage3_roads(gdb: str) -> None:
             ])
             rid += 1
 
-    log(f"  Inserted {rid} road features ("
+    log(f"  Inserted {rid} aggregate Roads features ("
         f"{len(primaries)} primary, "
         f"{len(secondaries)} secondary, "
         f"{len(locals_grid)} local, "
         f"{len(t_stubs)} T-stubs, "
         f"{len(overlaps)} overlaps)")
+
+    # ===== v3 named-class road layers =====================================
+    # Freeway: long primary arterials, with True-Curve interchanges spliced
+    # into the geometry where feasible (Pro JSON circular arcs).
+    log("  Emitting Freeway / Highway / Parkway / Asphalt_Road / Gravel")
+    fwy_id = hwy_id = pkwy_id = asph_id = grv_id = 0
+    bid = cid = 0
+
+    crossings_for_layer: List[Tuple[List[Tuple[float, float]], str]] = []
+
+    with arcpy.da.InsertCursor(
+            freeway_fc, ["SHAPE@", "FwyID", "Name", "HasTrueCurve"]) as fwy:
+        # Treat the longest 50% of primaries as Freeways.
+        primaries_sorted = sorted(primaries, key=len, reverse=True)
+        n_fwy = max(1, len(primaries_sorted) // 2)
+        for coords in primaries_sorted[:n_fwy]:
+            # Insert as a True-Curve polyline if the first/last/middle are
+            # well-separated, otherwise as a dense polyline.
+            try:
+                tc = _truecurve_polyline(
+                    coords[0], coords[-1], coords[len(coords) // 2])
+                fwy.insertRow([
+                    tc, fwy_id, f"Fwy_{fwy_id:02d}", 1,
+                ])
+                # Mirror the densely-vertexed approximation into the
+                # aggregate ROAD_PATHS so downstream stages still see it
+                # as a discrete polyline they can offset / cross.
+                ROAD_PATHS.append((coords, "FREEWAY"))
+                crossings_for_layer.append((coords, "FREEWAY"))
+            except Exception:
+                fwy.insertRow([
+                    make_polyline(coords), fwy_id,
+                    f"Fwy_{fwy_id:02d}", 0,
+                ])
+                ROAD_PATHS.append((coords, "FREEWAY"))
+                crossings_for_layer.append((coords, "FREEWAY"))
+            fwy_id += 1
+
+    with arcpy.da.InsertCursor(
+            highway_fc, ["SHAPE@", "HwyID", "Name", "HasTrueCurve"]) as hwy:
+        # Remaining primaries become Highways, and we splice True-Curve
+        # interchange ramps into them at midpoints.
+        for coords in primaries_sorted[n_fwy:]:
+            try:
+                tc = _truecurve_polyline(
+                    coords[0], coords[-1], coords[len(coords) // 2])
+                hwy.insertRow([tc, hwy_id, f"Hwy_{hwy_id:02d}", 1])
+            except Exception:
+                hwy.insertRow([
+                    make_polyline(coords), hwy_id, f"Hwy_{hwy_id:02d}", 0,
+                ])
+            ROAD_PATHS.append((coords, "HIGHWAY"))
+            crossings_for_layer.append((coords, "HIGHWAY"))
+            hwy_id += 1
+
+        # Plus a few standalone True-Curve highway ramps (sharp arcs).
+        for _ in range(8):
+            cx0 = clamp(PLAIN_CENTER[0] + random.uniform(-3500, 3500),
+                        X_MIN + 500, X_MAX - 500)
+            cy0 = clamp(PLAIN_CENTER[1] + random.uniform(-3500, 3500),
+                        Y_MIN + 500, Y_MAX - 500)
+            r = random.uniform(220, 500)
+            a0 = random.uniform(0, 2 * math.pi)
+            sweep = random.uniform(math.pi / 4, math.pi / 2)
+            sp = (cx0 + r * math.cos(a0), cy0 + r * math.sin(a0))
+            ep = (cx0 + r * math.cos(a0 + sweep),
+                  cy0 + r * math.sin(a0 + sweep))
+            mp = (cx0 + r * math.cos(a0 + sweep / 2),
+                  cy0 + r * math.sin(a0 + sweep / 2))
+            try:
+                hwy.insertRow([
+                    _truecurve_polyline(sp, ep, mp),
+                    hwy_id, f"HwyRamp_{hwy_id:02d}", 1,
+                ])
+                hwy_id += 1
+            except Exception:
+                pass
+
+    # Parkway: a dense-vertex switchback up the foothill of Mt. Titan.
+    with arcpy.da.InsertCursor(
+            parkway_fc,
+            ["SHAPE@", "PkwyID", "Name", "Switchback"]) as pkwy:
+        switchback_coords: List[Tuple[float, float]] = []
+        # Anchor at the foot of Mt. Titan, climb in tight switchbacks
+        # toward the summit using thousands of densely-packed vertices.
+        cx0 = MT_TITAN_CX + 1500.0
+        cy0 = MT_TITAN_CY - 1500.0
+        cx1 = MT_TITAN_CX + 200.0
+        cy1 = MT_TITAN_CY - 200.0
+        n_legs = 9
+        verts_per_leg = 220
+        for leg in range(n_legs):
+            tA = leg / n_legs
+            tB = (leg + 1) / n_legs
+            ax = lerp(cx0, cx1, tA)
+            ay = lerp(cy0, cy1, tA)
+            bx = lerp(cx0, cx1, tB)
+            by = lerp(cy0, cy1, tB)
+            # Alternate side offset for the switchback.
+            side = 1.0 if leg % 2 == 0 else -1.0
+            for s in range(verts_per_leg):
+                t = s / (verts_per_leg - 1)
+                x = lerp(ax, bx, t)
+                y = lerp(ay, by, t)
+                # Perpendicular bow that flips at midpoint of the leg.
+                bow_amp = 60.0 * math.sin(math.pi * t) * side
+                # Compute perpendicular at this leg.
+                ldx = bx - ax
+                ldy = by - ay
+                lmag = math.hypot(ldx, ldy) or 1.0
+                nx_ = -ldy / lmag
+                ny_ = ldx / lmag
+                x += nx_ * bow_amp
+                y += ny_ * bow_amp
+                switchback_coords.append((x, y))
+        pkwy.insertRow([
+            make_polyline(switchback_coords),
+            pkwy_id, "Mt_Titan_Switchback", 1,
+        ])
+        ROAD_PATHS.append((switchback_coords, "PARKWAY"))
+        crossings_for_layer.append((switchback_coords, "PARKWAY"))
+        pkwy_id += 1
+
+        # A handful of straight shorter parkways across the plain.
+        for _ in range(3):
+            coords = _build_secondary_road(primaries)
+            if len(coords) >= 4:
+                pkwy.insertRow([
+                    make_polyline(coords),
+                    pkwy_id, f"Pkwy_{pkwy_id:02d}", 0,
+                ])
+                ROAD_PATHS.append((coords, "PARKWAY"))
+                crossings_for_layer.append((coords, "PARKWAY"))
+                pkwy_id += 1
+
+    # Asphalt_Road: the local plain grid + secondary connectors.
+    with arcpy.da.InsertCursor(
+            asphalt_fc, ["SHAPE@", "RoadID", "Name"]) as asph:
+        for coords in secondaries:
+            asph.insertRow([
+                make_polyline(coords), asph_id, f"Asph_{asph_id:04d}",
+            ])
+            crossings_for_layer.append((coords, "ASPHALT_ROAD"))
+            asph_id += 1
+        for coords in locals_grid:
+            asph.insertRow([
+                make_polyline(coords), asph_id, f"AsphGrid_{asph_id:04d}",
+            ])
+            crossings_for_layer.append((coords, "ASPHALT_ROAD"))
+            asph_id += 1
+
+    # Gravel: T-stubs are a great natural fit for unpaved stubs, plus a
+    # handful of additional rural tracks meandering off the plain edges.
+    with arcpy.da.InsertCursor(
+            gravel_fc, ["SHAPE@", "RoadID", "Name"]) as grv:
+        for coords in t_stubs:
+            grv.insertRow([
+                make_polyline(coords), grv_id, f"Gravel_{grv_id:04d}",
+            ])
+            crossings_for_layer.append((coords, "GRAVEL"))
+            grv_id += 1
+        for _ in range(20):
+            x0, y0 = (clamp(random.uniform(X_MIN + 200, X_MAX - 200),
+                            X_MIN + 200, X_MAX - 200),
+                      clamp(random.uniform(Y_MIN + 200, Y_MAX - 200),
+                            Y_MIN + 200, Y_MAX - 200))
+            ang = random.uniform(0, 2 * math.pi)
+            length = random.uniform(180, 500)
+            steps = 60
+            cx_, cy_ = x0, y0
+            coords = [(x0, y0)]
+            for s in range(1, steps + 1):
+                t = s / steps
+                cx_ += (length / steps) * math.cos(ang) + random.uniform(-3, 3)
+                cy_ += (length / steps) * math.sin(ang) + random.uniform(-3, 3)
+                coords.append((cx_, cy_))
+            grv.insertRow([
+                make_polyline(coords), grv_id, f"Gravel_{grv_id:04d}",
+            ])
+            crossings_for_layer.append((coords, "GRAVEL"))
+            grv_id += 1
+
+    log(f"  Named layers inserted: "
+        f"Freeway={fwy_id} Highway={hwy_id} Parkway={pkwy_id} "
+        f"Asphalt_Road={asph_id} Gravel={grv_id}")
+
+    # ----- Bridge_P / Culvert_Pnt at every road x river intersection -----
+    log("  Computing Bridge_P / Culvert_Pnt at named-road x river crossings")
+    with arcpy.da.InsertCursor(
+            bridge_fc, ["SHAPE@", "BridgeID", "RoadClass", "RiverIdx"]) as bp, \
+         arcpy.da.InsertCursor(
+            culvert_fc,
+            ["SHAPE@", "CulvertID", "RoadClass", "RiverIdx"]) as cp:
+        for coords, rcls in crossings_for_layer:
+            for ri, river in enumerate(RIVER_PATHS):
+                if len(river) < 2:
+                    continue
+                # Cheap bbox rejection.
+                rx_min = min(p[0] for p in river)
+                rx_max = max(p[0] for p in river)
+                ry_min = min(p[1] for p in river)
+                ry_max = max(p[1] for p in river)
+                cx_min = min(p[0] for p in coords)
+                cx_max = max(p[0] for p in coords)
+                cy_min = min(p[1] for p in coords)
+                cy_max = max(p[1] for p in coords)
+                if (cx_max < rx_min or cx_min > rx_max or
+                        cy_max < ry_min or cy_min > ry_max):
+                    continue
+                first_hit = None
+                for i in range(len(coords) - 1):
+                    if first_hit is not None:
+                        break
+                    for j in range(len(river) - 1):
+                        hit = _segment_intersection(
+                            coords[i], coords[i + 1],
+                            river[j], river[j + 1])
+                        if hit is None:
+                            continue
+                        first_hit = hit
+                        break
+                if first_hit is None:
+                    continue
+                ix, iy, _t, _u = first_hit
+                # Major roads -> Bridge_P, minor roads -> Culvert_Pnt.
+                if rcls in ("FREEWAY", "HIGHWAY", "PARKWAY"):
+                    bp.insertRow([make_point(ix, iy), bid, rcls, ri])
+                    bid += 1
+                else:
+                    cp.insertRow([make_point(ix, iy), cid, rcls, ri])
+                    cid += 1
+
+    log(f"  Inserted Bridge_P={bid}, Culvert_Pnt={cid} at river crossings")
 
 
 
@@ -1122,15 +1497,20 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
             ("HeightM", "FLOAT", 0),
         ),
     )
+    # v3: rename to Gas_Pipe_L / Power_Line_L per the project map sample.
     gas_fc = create_fc(
-        "Gas_Pipes", "POLYLINE",
-        fields=(("Diameter_in", "SHORT", 0), ("PipeID", "LONG", 0)),
+        "Gas_Pipe_L", "POLYLINE",
+        fields=(("Diameter_in", "SHORT", 0),
+                ("PipeID", "LONG", 0),
+                ("ShiftMeters", "FLOAT", 0),
+                ("Profile", "TEXT", 24)),
     )
     power_fc = create_fc(
-        "Power_Lines", "POLYLINE",
+        "Power_Line_L", "POLYLINE",
         fields=(("Voltage_kV", "SHORT", 0),
                 ("LineID", "LONG", 0),
-                ("Profile", "TEXT", 24)),
+                ("Profile", "TEXT", 24),
+                ("CrossAngleDeg", "FLOAT", 0)),
     )
     trees_fc = create_fc(
         "Trees", "POINT",
@@ -1217,69 +1597,119 @@ def build_stage4_megacity_and_utilities(gdb: str) -> None:
     log(f"  Inserted {inserted:,} along-road buildings after "
         f"{attempts:,} attempts")
 
-    # ---- Gas_Pipes -- exactly parallel under each major road -------------
-    log("  Inserting Gas_Pipes parallel under primary/secondary roads")
+    # ---- Gas_Pipe_L -- tangent overlap with road edges (P02 nightmare) --
+    # Pipes are co-located with the road centerline, shifted by exactly
+    # 0.0 to 0.5 m -- close enough that they appear to *overlap* the road
+    # edge in any sane symbology, which is the precise stress condition
+    # Plugin 02 tries to detect.
+    log("  Inserting Gas_Pipe_L (0.0-0.5 m tangent overlap of major roads)")
     pipe_id = 0
     with arcpy.da.InsertCursor(
-            gas_fc, ["SHAPE@", "Diameter_in", "PipeID"]) as cur:
+            gas_fc, ["SHAPE@", "Diameter_in", "PipeID",
+                     "ShiftMeters", "Profile"]) as cur:
         for coords, cls in ROAD_PATHS:
-            if cls not in ("PRIMARY", "SECONDARY"):
+            if cls not in ("PRIMARY", "SECONDARY", "FREEWAY", "HIGHWAY"):
                 continue
-            parallel = _parallel_polyline(coords, GAS_PIPE_OFFSET)
+            shift = random.uniform(0.0, 0.5)
+            parallel = _parallel_polyline(coords, shift)
+            # Plain polyline is sufficient for tangent overlap; the
+            # micro-shift creates a near-coincident geometry that *should*
+            # be flagged as a deconfliction problem by Plugin 02.
             cur.insertRow([
                 make_polyline(parallel),
                 random.choice([8, 12, 16, 24, 36]),
-                pipe_id,
+                pipe_id, shift,
+                "TANGENT_OVERLAP",
             ])
             pipe_id += 1
-    log(f"  Inserted {pipe_id} gas pipes")
 
-    # ---- Power_Lines -- mostly parallel; conflict zones cross at 25 deg --
-    log(f"  Inserting Power_Lines (with up to {POWER_LINE_CONFLICT_ZONES} "
-        f"acute-angle conflict zones)")
+        # A separate set of "true-curve mirror" pipes attached to the
+        # Highway True-Curve shapes -- these are emitted as Pro JSON
+        # circular arcs offset by sub-meter, so even arc-aware
+        # deconfliction must catch them.
+        primaries_for_arc = [c for c, cls in ROAD_PATHS
+                             if cls in ("FREEWAY", "HIGHWAY")][:8]
+        for coords in primaries_for_arc:
+            if len(coords) < 6:
+                continue
+            shift = random.uniform(0.0, 0.5)
+            offset = _parallel_polyline(coords, shift)
+            try:
+                tc = _truecurve_polyline(
+                    offset[0], offset[-1], offset[len(offset) // 2])
+                cur.insertRow([
+                    tc, random.choice([24, 36]),
+                    pipe_id, shift, "TRUECURVE_TANGENT",
+                ])
+                pipe_id += 1
+            except Exception:
+                pass
+    log(f"  Inserted {pipe_id} Gas_Pipe_L features (tangent + true-curve)")
+
+    # ---- Power_Line_L -- zig-zag crossing True-Curve highways at 5-10 deg
+    log("  Inserting Power_Line_L (5-10 deg acute zig-zags across "
+        "True-Curve highways)")
     line_id = 0
-    primaries_only = [c for c, cls in ROAD_PATHS if cls == "PRIMARY"]
+    primaries_only = [c for c, cls in ROAD_PATHS
+                      if cls in ("PRIMARY", "FREEWAY", "HIGHWAY")]
     n_conflicts = min(POWER_LINE_CONFLICT_ZONES, len(primaries_only))
-    conflict_indices = set(random.sample(range(len(primaries_only)),
-                                          n_conflicts)) if primaries_only else set()
+    conflict_indices = (set(random.sample(range(len(primaries_only)),
+                                          n_conflicts))
+                        if primaries_only else set())
     with arcpy.da.InsertCursor(
-            power_fc, ["SHAPE@", "Voltage_kV", "LineID", "Profile"]) as cur:
+            power_fc,
+            ["SHAPE@", "Voltage_kV", "LineID", "Profile", "CrossAngleDeg"]) as cur:
+        # Baseline: long parallel power lines on the *opposite* side from
+        # the gas pipe, with a healthy clearance.
         for coords, cls in ROAD_PATHS:
-            if cls not in ("PRIMARY", "SECONDARY"):
+            if cls not in ("PRIMARY", "SECONDARY", "FREEWAY", "HIGHWAY"):
                 continue
             parallel = _parallel_polyline(coords, -POWER_LINE_OFFSET)
             cur.insertRow([
                 make_polyline(parallel),
                 random.choice([69, 115, 230, 345]),
-                line_id,
-                "PARALLEL",
+                line_id, "PARALLEL", 0.0,
             ])
             line_id += 1
 
+        # Acute-angle conflict zones: extremely shallow (5-10 deg)
+        # zig-zag transmission lines that thread along, and repeatedly
+        # *brush against*, the sweeping True-Curve highway.
         for k, coords in enumerate(primaries_only):
             if k not in conflict_indices or len(coords) < 12:
                 continue
+            cross_deg = random.uniform(5.0, 10.0)
             mid_idx = len(coords) // 2
             mid = coords[mid_idx]
             nxt = coords[mid_idx + 1]
             ang_road = math.atan2(nxt[1] - mid[1], nxt[0] - mid[0])
-            ang_cross = ang_road + math.radians(25.0)
-            length = 1800.0
-            x0 = mid[0] - 0.5 * length * math.cos(ang_cross)
-            y0 = mid[1] - 0.5 * length * math.sin(ang_cross)
-            x1 = mid[0] + 0.5 * length * math.cos(ang_cross)
-            y1 = mid[1] + 0.5 * length * math.sin(ang_cross)
-            cross_coords: List[Tuple[float, float]] = []
-            steps = 40
-            for s in range(steps + 1):
-                tt = s / steps
-                cross_coords.append((lerp(x0, x1, tt), lerp(y0, y1, tt)))
+            # Build a zig-zag that travels broadly in the *same* direction
+            # as the road but flips back and forth across it at 5-10 deg.
+            ang_pos = ang_road + math.radians(cross_deg)
+            ang_neg = ang_road - math.radians(cross_deg)
+            leg_len = 350.0
+            n_legs = 14
+            zig: List[Tuple[float, float]] = []
+            x, y = (mid[0] - 0.5 * n_legs * leg_len * math.cos(ang_road),
+                    mid[1] - 0.5 * n_legs * leg_len * math.sin(ang_road))
+            zig.append((x, y))
+            for leg in range(n_legs):
+                a = ang_pos if leg % 2 == 0 else ang_neg
+                steps = 12
+                for s in range(1, steps + 1):
+                    t = s / steps
+                    nx_ = x + leg_len * t * math.cos(a)
+                    ny_ = y + leg_len * t * math.sin(a)
+                    zig.append((nx_, ny_))
+                x = zig[-1][0]
+                y = zig[-1][1]
             cur.insertRow([
-                make_polyline(cross_coords),
-                500, line_id, "ACUTE_CROSS",
+                make_polyline(zig),
+                500, line_id, "ACUTE_ZIGZAG", cross_deg,
             ])
             line_id += 1
-    log(f"  Inserted {line_id} power line features")
+    log(f"  Inserted {line_id} Power_Line_L features "
+        f"({n_conflicts} acute-angle conflict zones)")
 
     # ---- True-Curve highway interchanges --------------------------------
     log("  Inserting True-Curve highway interchanges (test arc + ramps)")
@@ -1406,25 +1836,34 @@ def _find_steep_slope_segment(level: float,
 
 
 def build_stage5_anomalies_and_edges(gdb: str) -> None:
-    log("[Stage 5] Building Springs, Map_Frame, Custom_AOI, Label boxes")
+    log("[Stage 5] Building Spring_Pnt, Map_Frame, Custom_AOI, Label boxes")
 
-    # --- Springs ----------------------------------------------------------
+    # --- Spring_Pnt -- v3: strict steep-slope placement only -------------
+    # Plugin 06 derives "downhill" rotation from the local terrain
+    # gradient. Springs must therefore live on real slopes, never on the
+    # flat plain (where |grad E| -> 0 produces a degenerate rotation).
     springs_fc = create_fc(
-        "Springs", "POINT",
+        "Spring_Pnt", "POINT",
         fields=(
             ("SpringID", "LONG", 0),
             ("FlowGPM", "FLOAT", 0),
             ("Kind", "TEXT", 24),
             ("Elev_M", "DOUBLE", 0),
+            ("SlopeMag", "DOUBLE", 0),
         ),
     )
+
+    # Strict slope thresholds for v3 -- significantly tighter than v2.
+    SLOPE_MIN_FOR_SPRING = 0.10  # |grad z| must exceed 10 cm/m
 
     sid = 0
     with arcpy.da.InsertCursor(
             springs_fc,
-            ["SHAPE@", "SpringID", "FlowGPM", "Kind", "Elev_M"]) as cur:
+            ["SHAPE@", "SpringID", "FlowGPM", "Kind", "Elev_M",
+             "SlopeMag"]) as cur:
 
-        # Fault Line: 5 perfectly collinear springs along a steep slope.
+        # Fault Line: 5 perfectly collinear springs along a steep slope
+        # contour (preserved from v2 -- needed to provoke SVD singular).
         fault_poly = _find_steep_slope_segment(FAULT_LINE_TARGET_ELEVATION)
         if fault_poly is None:
             warn("Could not locate steep contour for Fault Line; "
@@ -1444,27 +1883,41 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
             x = lerp(fault_a[0], fault_b[0], t)
             y = lerp(fault_a[1], fault_b[1], t)
             z = get_elevation(x, y)
+            sm = slope_magnitude(x, y)
             cur.insertRow([
                 make_point(x, y), sid,
                 random.uniform(2.0, 14.0),
-                "FAULT_LINE", z,
+                "FAULT_LINE", z, sm,
             ])
             sid += 1
 
-        # Isolated Spring -- on the plain, far from any mountain contour.
-        iso_xy = (PLAIN_CENTER[0] + 1500.0, PLAIN_CENTER[1] - 1500.0)
+        # Isolated Spring -- in a steep slope zone but topologically
+        # disconnected from the contour cluster. Kept as Plugin 06's
+        # "no-neighbour" edge case; v3 still demands a non-zero gradient.
+        iso_xy: Optional[Tuple[float, float]] = None
+        for _ in range(2000):
+            xx = random.uniform(X_MIN + 200, X_MAX - 200)
+            yy = random.uniform(Y_MIN + 200, Y_MAX - 200)
+            if (slope_magnitude(xx, yy) >= SLOPE_MIN_FOR_SPRING and
+                    1500.0 < get_elevation(xx, yy) < 1800.0):
+                iso_xy = (xx, yy)
+                break
+        if iso_xy is None:
+            iso_xy = (MT_TITAN_CX + 1200.0, MT_TITAN_CY + 800.0)
+        sm_iso = slope_magnitude(*iso_xy)
         cur.insertRow([
             make_point(*iso_xy), sid, 0.6, "ISOLATED",
-            get_elevation(*iso_xy),
+            get_elevation(*iso_xy), sm_iso,
         ])
         sid += 1
 
-        # Ambient base-of-mountain springs.
-        log(f"  Seeding ambient springs in elevation band "
-            f"[{SPRING_BASE_ELEV_LO:.0f}, {SPRING_BASE_ELEV_HI:.0f}] m")
+        # Ambient steep-slope springs (v3 strict gating).
+        log(f"  Seeding ambient springs strictly on steep slopes "
+            f"(|grad z| >= {SLOPE_MIN_FOR_SPRING:.2f}, elev in "
+            f"[{SPRING_BASE_ELEV_LO:.0f}, {SPRING_BASE_ELEV_HI:.0f}] m)")
         ambient = 0
         attempts = 0
-        max_attempts = SPRINGS_BASE_COUNT * 30
+        max_attempts = SPRINGS_BASE_COUNT * 60
         while ambient < SPRINGS_BASE_COUNT and attempts < max_attempts:
             attempts += 1
             x = random.uniform(X_MIN + 80, X_MAX - 80)
@@ -1472,17 +1925,18 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
             z = get_elevation(x, y)
             if not (SPRING_BASE_ELEV_LO <= z <= SPRING_BASE_ELEV_HI):
                 continue
-            if slope_magnitude(x, y) < 0.04:
+            sm = slope_magnitude(x, y)
+            if sm < SLOPE_MIN_FOR_SPRING:
                 continue
             cur.insertRow([
                 make_point(x, y), sid,
                 random.uniform(0.8, 28.0),
-                "BASE", z,
+                "BASE", z, sm,
             ])
             sid += 1
             ambient += 1
-        log(f"  Inserted {ambient} ambient base-of-mountain springs "
-            f"after {attempts} attempts")
+        log(f"  Inserted {ambient} ambient steep-slope springs after "
+            f"{attempts} attempts")
 
     # --- Map_Frame --------------------------------------------------------
     frame_fc = create_fc(
@@ -1531,10 +1985,11 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
             ("LabelID", "LONG", 0),
             ("LabelText", "TEXT", 64),
             ("Priority", "SHORT", 0),
+            ("ClusterKind", "TEXT", 16),
         ),
     )
     log(f"  Inserting {LABEL_BOXES:,} overlapping label candidate boxes "
-        "(clustered on contour vertices)")
+        "(clustered on contour vertices + V-apex stress points)")
 
     # Cluster centers sampled from contour vertices: the AABB stress is also
     # topologically tied to the terrain.
@@ -1548,9 +2003,49 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
     if not cluster_centers:
         cluster_centers.append(PLAIN_CENTER)
 
+    # ----- V-apex hot spots (P03/P04 nightmare) -------------------------
+    # Detect contour vertices whose interior angle is < 60 deg -- those
+    # are the apexes of valley/creek "V" shapes. Pack many label boxes
+    # exactly on top of each one to overload collision detection.
+    log("  Detecting V-apex contour vertices for label cluster overload")
+    v_apex_centers: List[Tuple[float, float]] = []
+    apex_levels = [1100.0, 1180.0, 1260.0, 1340.0, 1420.0, 1500.0, 1580.0]
+    for lvl in apex_levels:
+        polys = _stitch_segments(_marching_squares_segments(lvl))
+        for poly in polys:
+            if len(poly) < 5:
+                continue
+            for i in range(2, len(poly) - 2):
+                p0 = poly[i - 2]
+                p1 = poly[i]
+                p2 = poly[i + 2]
+                v1x = p0[0] - p1[0]
+                v1y = p0[1] - p1[1]
+                v2x = p2[0] - p1[0]
+                v2y = p2[1] - p1[1]
+                m1 = math.hypot(v1x, v1y)
+                m2 = math.hypot(v2x, v2y)
+                if m1 < 1e-6 or m2 < 1e-6:
+                    continue
+                cos_int = max(-1.0, min(1.0,
+                                        (v1x * v2x + v1y * v2y) / (m1 * m2)))
+                ang_int = math.degrees(math.acos(cos_int))
+                if ang_int < 60.0:  # tight V apex
+                    v_apex_centers.append(p1)
+    log(f"  Found {len(v_apex_centers):,} V-apex hot spots")
+
+    if not v_apex_centers:
+        v_apex_centers = list(cluster_centers)
+
+    n_apex_boxes = LABEL_BOXES // 2  # half the labels stack on V-apexes
+    n_general = LABEL_BOXES - n_apex_boxes
+
     with arcpy.da.InsertCursor(
-            label_fc, ["SHAPE@", "LabelID", "LabelText", "Priority"]) as cur:
-        for k in range(LABEL_BOXES):
+            label_fc,
+            ["SHAPE@", "LabelID", "LabelText", "Priority",
+             "ClusterKind"]) as cur:
+        # General contour-vertex clusters (kept from v2, slightly shrunk).
+        for k in range(n_general):
             cx_, cy_ = random.choice(cluster_centers)
             cx_ += random.uniform(-50, 50)
             cy_ += random.uniform(-50, 50)
@@ -1565,6 +2060,27 @@ def build_stage5_anomalies_and_edges(gdb: str) -> None:
                 k,
                 f"LBL_{k:06d}",
                 random.randint(1, 9),
+                "CONTOUR",
+            ])
+
+        # V-apex stress clusters: piles of small AABBs at each apex.
+        for k in range(n_apex_boxes):
+            apex_id = k % len(v_apex_centers)
+            cx_, cy_ = v_apex_centers[apex_id]
+            cx_ += random.uniform(-6, 6)   # very tight pile around apex
+            cy_ += random.uniform(-6, 6)
+            w = random.uniform(8, 28)
+            h = random.uniform(4, 10)
+            ring = [(cx_ - w / 2, cy_ - h / 2),
+                    (cx_ + w / 2, cy_ - h / 2),
+                    (cx_ + w / 2, cy_ + h / 2),
+                    (cx_ - w / 2, cy_ + h / 2)]
+            cur.insertRow([
+                make_polygon([ring]),
+                n_general + k,
+                f"VAPEX_{n_general + k:06d}",
+                random.randint(7, 9),  # apex labels are high priority
+                "VAPEX",
             ])
 
 
@@ -1588,7 +2104,50 @@ def _grid_cells(x_min: float, y_min: float, x_max: float, y_max: float,
 
 
 def build_p07_index_grid(gdb: str) -> None:
-    log("[P07] Building Index_Grid (projected + GCS) and Huge_Grid_Extent")
+    log("[P07] Building Index_Sheet block (16-24 sheets) + Index_Grid + GCS "
+        "+ Huge_Grid_Extent")
+
+    # ----- v3 Index_Sheet: contiguous block of 16-24 polygon sheets ------
+    # The grid builder plugin's "happy path" is producing a small
+    # contiguous index of named map sheets. We pick a 5x4 = 20 layout
+    # by default; the count parameter is biased to land in [16, 24].
+    sheet_fc = create_fc(
+        "Index_Sheet", "POLYGON",
+        fields=(
+            ("SheetID", "LONG", 0),
+            ("Col", "LONG", 0),
+            ("Row", "LONG", 0),
+            ("SheetName", "TEXT", 32),
+        ),
+        sr=SR_PROJECTED,
+    )
+    sheet_layouts = [(4, 4), (4, 5), (5, 4), (5, 5), (6, 3),
+                     (3, 6), (4, 6), (6, 4)]
+    sheet_layouts = [
+        (nx, ny) for nx, ny in sheet_layouts if 16 <= nx * ny <= 24
+    ]
+    sheet_nx, sheet_ny = random.choice(sheet_layouts)
+    # Pad inwards from the AOI so the sheet block is clearly contiguous
+    # but does not touch the AOI border.
+    pad = 1500.0
+    sx0 = X_MIN + pad
+    sy0 = Y_MIN + pad
+    sx1 = X_MAX - pad
+    sy1 = Y_MAX - pad
+    log(f"  Sheet block layout: {sheet_nx} cols x {sheet_ny} rows = "
+        f"{sheet_nx * sheet_ny} sheets")
+    sheet_id = 0
+    with arcpy.da.InsertCursor(
+            sheet_fc,
+            ["SHAPE@", "SheetID", "Col", "Row", "SheetName"]) as cur:
+        for i, j, ring in _grid_cells(sx0, sy0, sx1, sy1,
+                                      sheet_nx, sheet_ny):
+            cur.insertRow([
+                make_polygon([ring], sr=SR_PROJECTED),
+                sheet_id, i, j,
+                f"Sheet_R{j:02d}C{i:02d}",
+            ])
+            sheet_id += 1
 
     grid_fc = create_fc(
         "Index_Grid", "POLYGON",
@@ -1678,7 +2237,7 @@ def _summarise(gdb: str) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate the TitanWorld_Pro 2.0 stress-test GDB.",
+        description="Generate the TitanWorld_Pro 3.0 stress-test GDB.",
     )
     p.add_argument(
         "--out",
@@ -1698,7 +2257,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     log("=" * 72)
-    log(" TitanWorld_Pro 2.0 :: Topologically Logical Pipeline")
+    log(" TitanWorld_Pro 3.0 :: Topologically Logical Pipeline + "
+        "named-class layers + V-apex labels")
     log(f" Random seed     : {RANDOM_SEED}")
     log(f" AOI extent      : X[{X_MIN}, {X_MAX}]  Y[{Y_MIN}, {Y_MAX}]  "
         f"({WIDTH/1000:.1f} km x {HEIGHT/1000:.1f} km)")
