@@ -1,0 +1,23 @@
+<!-- This file documents the Legacy folder. Text direction: Right-to-Left (Persian). -->
+
+# پوشه‌ی Legacy افزونه ۲ (Road Deconflict)
+
+> این پوشه برای نگه‌داری نسخه‌های **قدیمی/مرجع** این افزونه در نظر گرفته شده است.
+> این نسخه‌ها فقط برای **مرجع تاریخی** هستند و برای کارهای جدید **توصیه نمی‌شوند**.
+
+## نسخه‌ی قدیمی ثبت‌شده در مستندات
+
+در فایل `PROJECT_MAP.md` نسخه‌ی قدیمی زیر برای این افزونه نام برده شده است:
+
+- `Plugin02_RoadDeconflict_ArcMap_v4_fixedUIUX_py27.pyt`  ← نسخه‌ی مرجع قدیمی (ArcMap)
+
+> ⚠️ **نیازمند تأیید:** این فایل در نسخه‌ی فعلی مخزن **موجود نیست** (نه در فایل‌ها و نه در
+> تاریخچه‌ی گیت). نام آن فقط در مستندات ذکر شده است. اگر این فایل را در اختیار دارید،
+> آن را داخل همین پوشه قرار دهید تا ساختار کامل شود.
+
+## نسخه‌های فعال (توصیه‌شده)
+
+| سکو | فایل |
+|------|------|
+| ArcMap (پایتون ۲٫۷) | `organized/Plugin02/ArcMap/Plugin02_RoadDeconflict_ArcMap_v5_hardened.pyt` |
+| ArcGIS Pro (پایتون ۳) | `organized/Plugin02/Pro/Plugin02_RoadDeconflict_Pro_v5_native.pyt` |
