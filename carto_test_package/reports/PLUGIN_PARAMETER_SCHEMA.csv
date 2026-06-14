@@ -1,0 +1,180 @@
+plugin_id,tool_class,index,name,datatype,parameter_type,multivalue,default,fields_created_or_required,notes
+Plugin01,BuildBridgePoints,0,roads,GPFeatureLayer,Required,yes,,reads road centerlines,barrier/reference (ref=ROAD)
+Plugin01,BuildBridgePoints,1,drains,GPFeatureLayer,Required,yes,,reads drainage lines,watercourse/canal/river
+Plugin01,BuildBridgePoints,2,out_ws,DEWorkspace,Required,no,,,output gdb
+Plugin01,BuildBridgePoints,3,out_name,GPString,Required,no,,creates output FC,
+Plugin01,BuildBridgePoints,4,sample_m,GPDouble,Required,no,8.0,,rotation sampling distance (map units)
+Plugin01,BuildBridgePoints,5,rot_field,GPString,Required,no,,creates ROT_RAW + rot field,
+Plugin01,BuildBridgePoints,6,rot_type,GPString,Required,no,GEOGRAPHIC,,ARITHMETIC|GEOGRAPHIC
+Plugin01,BuildBridgePoints,7,add_map,GPBoolean,Optional,no,True,,set False for headless
+Plugin01,BuildBridgePoints,8,tmpl_lyr,DEFile,Optional,no,,,optional .lyr symbology
+Plugin01,BuildBridgePoints,9,end_tol,GPDouble,Optional,no,2.0,,end-touch tolerance
+Plugin01,RotateExistingBridgePoints,0,in_pts,GPFeatureLayer,Required,no,,,existing points (Point/Multipoint)
+Plugin01,RotateExistingBridgePoints,1,ref,GPFeatureLayer,Required,yes,,,reference lines (Polyline)
+Plugin01,RotateExistingBridgePoints,2,upd_mode,GPString,Required,no,COPY_TO_OUTPUT,,COPY_TO_OUTPUT|UPDATE_IN_PLACE (UPDATE_IN_PLACE edits input)
+Plugin01,RotateExistingBridgePoints,3,out_ws,DEWorkspace,Optional,no,,,used if COPY_TO_OUTPUT
+Plugin01,RotateExistingBridgePoints,4,out_name,GPString,Optional,no,P_Bridge_Rot,creates output FC,
+Plugin01,RotateExistingBridgePoints,5,sample_m,GPDouble,Required,no,8.0,,
+Plugin01,RotateExistingBridgePoints,6,rot_field,GPString,Required,no,ROTATION,creates ROT_RAW + ROTATION,
+Plugin01,RotateExistingBridgePoints,7,rot_type,GPString,Required,no,GEOGRAPHIC,,
+Plugin01,RotateExistingBridgePoints,8,add_map,GPBoolean,Optional,no,True,,
+Plugin01,RotateExistingBridgePoints,9,tmpl_lyr,DEFile,Optional,no,,,
+Plugin02,RoadDeconflictTool,0,in_roads,GPFeatureLayer,Required,no,,reads roads,barrier
+Plugin02,RoadDeconflictTool,1,clearance,GPDouble,Required,no,6.0,,clearance distance (map units)
+Plugin02,RoadDeconflictTool,2,in_points,GPFeatureLayer,Optional,yes,,moves point targets,
+Plugin02,RoadDeconflictTool,3,in_lines,GPFeatureLayer,Optional,yes,,moves line targets,
+Plugin02,RoadDeconflictTool,4,in_polygons,GPFeatureLayer,Optional,yes,,moves polygon targets,
+Plugin02,RoadDeconflictTool,5,out_gdb,DEWorkspace,Required,no,,,
+Plugin02,RoadDeconflictTool,6,name_suffix,GPString,Optional,no,_RDCL,creates <name>_RDCL outputs,
+Plugin02,RoadDeconflictTool,7,aoi_poly,GPFeatureLayer,Optional,no,,,optional processing AOI
+Plugin02,RoadDeconflictTool,8,line_strategy,GPString,Optional,no,LOCAL_PUSH,,LOCAL_PUSH|WHOLE_OFFSET
+Plugin02,RoadDeconflictTool,9,offset_side,GPString,Optional,no,AUTO,,AUTO|LEFT|RIGHT
+Plugin02,RoadDeconflictTool,10,densify_step,GPDouble,Optional,no,0.0,,
+Plugin02,RoadDeconflictTool,11,preserve_endpoints,GPBoolean,Optional,no,True,,
+Plugin02,RoadDeconflictTool,12,smooth_iters,GPLong,Optional,no,0,,Chaikin smoothing
+Plugin02,RoadDeconflictTool,13,max_shift,GPDouble,Optional,no,0.0,,0=no cap
+Plugin02,RoadDeconflictTool,14,max_iter,GPLong,Optional,no,8,,
+Plugin02,RoadDeconflictTool,15,max_deflection_deg,GPDouble,Optional,no,25.0,,
+Plugin02,RoadDeconflictTool,16,use_near,GPBoolean,Optional,no,True,,
+Plugin02,RoadDeconflictTool,17,lock_field,GPString,Optional,no,,,value 0 locks a feature
+Plugin02,RoadDeconflictTool,18,create_errors,GPBoolean,Optional,no,True,creates *_errors,
+Plugin02,RoadDeconflictTool,19,create_vectors,GPBoolean,Optional,no,False,creates *_vectors,displacement vectors
+Plugin02,RoadDeconflictTool,20,write_csv,GPBoolean,Optional,no,True,writes CSV report,
+Plugin02,RoadDeconflictTool,21,keep_near_fields,GPBoolean,Optional,no,False,,disabled in UI
+Plugin02,RoadDeconflictTool,22,near_chunk_size,GPLong,Optional,no,50000,,
+Plugin03,OptimizeContourLabelAnchorsV4,0,in_contours,GPFeatureLayer,Required,no,,reads contours,
+Plugin03,OptimizeContourLabelAnchorsV4,1,elev_field,Field,Required,no,,reads elevation,depends on in_contours; numeric (Ortho_Hght)
+Plugin03,OptimizeContourLabelAnchorsV4,2,selection_mode,GPString,Required,no,ALL,,ALL|MAJOR_INTERVAL
+Plugin03,OptimizeContourLabelAnchorsV4,3,major_interval,GPDouble,Optional,no,100.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,4,interval_m,GPDouble,Required,no,500.0,,along-line interval
+Plugin03,OptimizeContourLabelAnchorsV4,5,safe_mm,GPDouble,Required,no,2.0,,safe distance from obstacles (mm)
+Plugin03,OptimizeContourLabelAnchorsV4,6,halo_mm,GPDouble,Optional,no,0.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,7,map_scale,GPDouble,Required,no,25000.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,8,obstacles,GPFeatureLayer,Optional,yes,,reads obstacles,lines/polys/points
+Plugin03,OptimizeContourLabelAnchorsV4,9,anno_layer,GPFeatureLayer,Optional,no,,,existing annotation barrier
+Plugin03,OptimizeContourLabelAnchorsV4,10,derive_text_metrics,GPBoolean,Optional,no,True,,
+Plugin03,OptimizeContourLabelAnchorsV4,11,font_size_pt,GPDouble,Optional,no,8.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,12,char_w_factor,GPDouble,Optional,no,0.6,,
+Plugin03,OptimizeContourLabelAnchorsV4,13,curv_method,GPString,Required,no,Hybrid,,Hybrid|ChordRatio|MaxDeflection|CurvatureEnergy
+Plugin03,OptimizeContourLabelAnchorsV4,14,curv_sample_m,GPDouble,Required,no,5.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,15,w_cr,GPDouble,Required,no,0.5,,
+Plugin03,OptimizeContourLabelAnchorsV4,16,w_md,GPDouble,Required,no,0.3,,
+Plugin03,OptimizeContourLabelAnchorsV4,17,w_ce,GPDouble,Required,no,0.2,,
+Plugin03,OptimizeContourLabelAnchorsV4,18,w_curv,GPDouble,Required,no,1.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,19,w_ovlp,GPDouble,Required,no,5.0,,
+Plugin03,OptimizeContourLabelAnchorsV4,20,w_center,GPDouble,Required,no,0.25,,
+Plugin03,OptimizeContourLabelAnchorsV4,21,max_ovlp,GPDouble,Optional,no,,,
+Plugin03,OptimizeContourLabelAnchorsV4,22,max_curv,GPDouble,Optional,no,,,
+Plugin03,OptimizeContourLabelAnchorsV4,23,min_contour_m,GPDouble,Optional,no,0.0,,short-segment filter
+Plugin03,OptimizeContourLabelAnchorsV4,24,short_policy,GPString,Required,no,PLACE_CENTER,,PLACE_CENTER|SKIP
+Plugin03,OptimizeContourLabelAnchorsV4,25,out_ws,DEWorkspace,Required,no,,,
+Plugin03,OptimizeContourLabelAnchorsV4,26,out_segments_name,GPString,Required,no,ContourLabelSegments,creates segments FC,
+Plugin03,OptimizeContourLabelAnchorsV4,27,out_points_name,GPString,Required,no,ContourLabelPoints,creates label points FC,
+Plugin03,OptimizeContourLabelAnchorsV4,28,make_footprints,GPBoolean,Optional,no,False,,
+Plugin03,OptimizeContourLabelAnchorsV4,29,out_footprints_name,GPString,Optional,no,ContourLabelFootprints,,
+Plugin03,OptimizeContourLabelAnchorsV4,30,make_stats,GPBoolean,Optional,no,True,creates stats table,
+Plugin03,OptimizeContourLabelAnchorsV4,31,out_stats_name,GPString,Optional,no,ContourLabelStats,,
+Plugin03,OptimizeContourLabelAnchorsV4,32,max_tries,GPLong,Required,no,11,,
+Plugin03,OptimizeContourLabelAnchorsV4,33,use_legacy_evaluation,GPBoolean,Optional,no,False,,
+Plugin04,ElevationTextDeconflictV5,0,input_mode,GPString,Required,no,POINT_LAYER_WITH_TEXT_FIELD,,POINT_LAYER_WITH_TEXT_FIELD|ANNOTATION_LAYER_AND_ANCHOR_POINTS
+Plugin04,ElevationTextDeconflictV5,1,in_points,GPFeatureLayer,Optional,no,,reads elevation points,Mode A (required at runtime for Mode A)
+Plugin04,ElevationTextDeconflictV5,2,text_field,Field,Optional,no,,reads label text,Mode A; depends on in_points
+Plugin04,ElevationTextDeconflictV5,3,anno_layer,GPFeatureLayer,Optional,no,,,Mode B annotation FC
+Plugin04,ElevationTextDeconflictV5,4,anchor_points,GPFeatureLayer,Optional,no,,,Mode B
+Plugin04,ElevationTextDeconflictV5,5,link_method,GPString,Optional,no,NEAREST_POINT,,NEAREST_POINT|FEATUREID_MATCH
+Plugin04,ElevationTextDeconflictV5,6,featureid_field,Field,Optional,no,FeatureID,,Mode B
+Plugin04,ElevationTextDeconflictV5,7,max_match_dist,GPString,Optional,no,,,blank=no limit
+Plugin04,ElevationTextDeconflictV5,8,rings,GPDouble,Required,yes,2 4 6,,candidate ring distances
+Plugin04,ElevationTextDeconflictV5,9,directions,GPLong,Required,no,16,,8|16|24|36
+Plugin04,ElevationTextDeconflictV5,10,obstacle_layers,GPFeatureLayer,Required,yes,,reads obstacles,REQUIRED (contours/grid/frame)
+Plugin04,ElevationTextDeconflictV5,11,conflict_test_mode,GPString,Required,no,BALANCED_EXTENT_THEN_GEOMETRY,,FAST_EXTENT_ONLY|BALANCED_EXTENT_THEN_GEOMETRY|ACCURATE_GEOMETRY_ONLY
+Plugin04,ElevationTextDeconflictV5,12,max_features_per_layer,GPLong,Optional,no,0,,deprecated
+Plugin04,ElevationTextDeconflictV5,13,padding,GPDouble,Optional,no,0.0,,Mode A
+Plugin04,ElevationTextDeconflictV5,14,extra_search,GPDouble,Optional,no,0.0,,
+Plugin04,ElevationTextDeconflictV5,15,reference_scale,GPLong,Optional,no,25000,,
+Plugin04,ElevationTextDeconflictV5,16,font_size_pt,GPDouble,Optional,no,8.0,,Mode A
+Plugin04,ElevationTextDeconflictV5,17,char_width_factor,GPDouble,Optional,no,1.0,,Mode A
+Plugin04,ElevationTextDeconflictV5,18,report_text_mode,GPString,Required,no,ASCII_SAFE_REPLACE,,UNICODE_BEST_EFFORT|ASCII_SAFE_REPLACE
+Plugin04,ElevationTextDeconflictV5,19,preview_only,GPBoolean,Optional,no,False,,Mode B guard
+Plugin04,ElevationTextDeconflictV5,20,debug_level,GPString,Optional,no,BASIC,,OFF|BASIC|VERBOSE
+Plugin04,ElevationTextDeconflictV5,21,debug_log_file,DEFile,Optional,no,,,
+Plugin04,ElevationTextDeconflictV5,22,create_moved_only,GPBoolean,Optional,no,True,creates moved-only output,
+Plugin04,ElevationTextDeconflictV5,23,search_pattern,GPString,Optional,no,FIXED_RINGS,,FIXED_RINGS|SPIRAL|GREEDY
+Plugin04,ElevationTextDeconflictV5,24,spiral_step,GPDouble,Optional,no,0.0,,
+Plugin04,ElevationTextDeconflictV5,25,direction_bias,GPString,Optional,no,CARDINAL_FIRST,,NONE|CARDINAL_FIRST|DIAGONAL_FIRST
+Plugin04,ElevationTextDeconflictV5,26,avoid_label_label,GPBoolean,Optional,no,True,,Mode A
+Plugin04,ElevationTextDeconflictV5,27,modeA_rotated_box,GPBoolean,Optional,no,True,,Mode A
+Plugin04,ElevationTextDeconflictV5,28,apply_rotation_modeB,GPBoolean,Optional,no,False,,Mode B
+Plugin04,ElevationTextDeconflictV5,29,rotation_write_mode,GPString,Optional,no,SET_ABSOLUTE,,SET_ABSOLUTE|ADD_DELTA
+Plugin04,ElevationTextDeconflictV5,30,create_modeB_points,GPBoolean,Optional,no,True,,Mode B
+Plugin04,ElevationTextDeconflictV5,31,create_leaderlines,GPBoolean,Optional,no,False,creates leader lines,
+Plugin04,ElevationTextDeconflictV5,32,leaderlines_moved_only,GPBoolean,Optional,no,True,,
+Plugin04,ElevationTextDeconflictV5,33,reverse_offsets,GPBoolean,Optional,no,False,,Mode B
+Plugin04,ElevationTextDeconflictV5,34,use_legacy_evaluation,GPBoolean,Optional,no,False,,(positional order: index 33 before derived outputs)
+Plugin05,SafeContourCleaner,0,in_contours,GPFeatureLayer,Required,yes,,reads contours,
+Plugin05,SafeContourCleaner,1,frame_polygon,GPFeatureLayer,Optional,no,,,frame/neatline polygon (protects edge)
+Plugin05,SafeContourCleaner,2,safe_margin_mu,GPDouble,Optional,no,0.0,,map units
+Plugin05,SafeContourCleaner,3,safe_margin_mm,GPDouble,Optional,no,0.0,,mm on map
+Plugin05,SafeContourCleaner,4,dense_threshold,GPDouble,Required,no,20.0,,dense distance (map units)
+Plugin05,SafeContourCleaner,5,min_neighbors,GPLong,Optional,no,1,,
+Plugin05,SafeContourCleaner,6,aoi_mode,GPString,Required,no,Frame only (default),,Frame only|Custom AOI only|Frame AND Custom AOI|Entire dataset
+Plugin05,SafeContourCleaner,7,custom_aoi,GPFeatureLayer,Optional,no,,,
+Plugin05,SafeContourCleaner,8,mask_mode,GPString,Required,no,Auto mask from dense zones (recommended),,
+Plugin05,SafeContourCleaner,9,external_mask,GPFeatureLayer,Optional,no,,,
+Plugin05,SafeContourCleaner,10,eligible_sql,GPString,Optional,no,1=1,,contours that CAN be cleaned
+Plugin05,SafeContourCleaner,11,protected_sql,GPString,Optional,no,,,contours that must never be cleaned (e.g. index)
+Plugin05,SafeContourCleaner,12,removal_method,GPString,Required,no,Segment Erase (recommended),,Segment Erase needs Advanced license|Delete Whole Features
+Plugin05,SafeContourCleaner,13,min_seg_length,GPDouble,Optional,no,0.0,,
+Plugin05,SafeContourCleaner,14,out_workspace,DEWorkspace,Optional,no,,,defaults to scratchGDB if blank
+Plugin05,SafeContourCleaner,15,out_clean_name,GPString,Required,no,Contours_CartoClean,creates cleaned copy,
+Plugin05,SafeContourCleaner,16,create_removed,GPBoolean,Optional,no,True,creates removed-segments layer,
+Plugin05,SafeContourCleaner,17,create_review,GPBoolean,Optional,no,True,creates review layer,dense-but-protected
+Plugin05,SafeContourCleaner,18,create_mask_out,GPBoolean,Optional,no,True,creates mask layer,
+Plugin05,SafeContourCleaner,19,write_report,GPBoolean,Optional,no,True,writes CSV,
+Plugin05,SafeContourCleaner,20,add_to_map,GPBoolean,Optional,no,True,,set False for headless
+Plugin05,SafeContourCleaner,21,dry_run,GPBoolean,Optional,no,False,,preview only (no cleaned output)
+Plugin05,SafeContourCleaner,22,near_chunk_size,GPLong,Optional,no,50000,,
+Plugin05,SafeContourCleaner,23,allow_full_map_processing,GPBoolean,Optional,no,False,,empty AOI -> error unless True
+Plugin06,SpringRotationFinalSuiteTool,0,springs,GPFeatureLayer,Required,no,,reads springs (point),
+Plugin06,SpringRotationFinalSuiteTool,1,contours,GPFeatureLayer,Required,no,,reads contours (polyline),
+Plugin06,SpringRotationFinalSuiteTool,2,elev_field,Field,Required,no,,reads elevation,numeric; depends on contours (Ortho_Hght)
+Plugin06,SpringRotationFinalSuiteTool,3,ignore_selection,GPBoolean,Optional,no,True,,process ALL features
+Plugin06,SpringRotationFinalSuiteTool,4,out_gdb,DEWorkspace,Required,no,,,must already EXIST and be *.gdb
+Plugin06,SpringRotationFinalSuiteTool,5,out_base_name,GPString,Required,no,springs_rotation_suite,creates output FCs,
+Plugin06,SpringRotationFinalSuiteTool,6,output_mode,GPString,Optional,no,SEPARATE_LAYERS,,SEPARATE_LAYERS|SINGLE_FIELDS
+Plugin06,SpringRotationFinalSuiteTool,7,create_summary,GPBoolean,Optional,no,False,creates summary table,
+Plugin06,SpringRotationFinalSuiteTool,8,sym_layer,GPFeatureLayer,Optional,no,,,symbology template
+Plugin06,SpringRotationFinalSuiteTool,9,auto_symbology,GPBoolean,Optional,no,True,,set False for headless
+Plugin06,SpringRotationFinalSuiteTool,10,symbol_size,GPDouble,Optional,no,40.0,,
+Plugin06,SpringRotationFinalSuiteTool,11,work_sr_mode,GPString,Optional,no,AUTO_UTM,,AUTO_UTM|USE_INPUT
+Plugin06,SpringRotationFinalSuiteTool,12,near_method,GPString,Optional,no,PLANAR,,PLANAR|GEODESIC
+Plugin06,SpringRotationFinalSuiteTool,13,search_radius,GPDouble,Optional,no,,,0/empty=UNLIMITED
+Plugin06,SpringRotationFinalSuiteTool,14,global_offset,GPDouble,Optional,no,0.0,,
+Plugin06,SpringRotationFinalSuiteTool,15,k_near,GPLong,Optional,no,8,,used by methods 02/04/05
+Plugin06,SpringRotationFinalSuiteTool,16,tangent_step,GPDouble,Optional,no,5.0,,used by method 01
+Plugin06,SpringRotationFinalSuiteTool,17,aoi_sketch,GPFeatureRecordSetLayer,Optional,no,,,polygon AOI sketch
+Plugin06,SpringRotationFinalSuiteTool,18,aoi_buffer,GPDouble,Optional,no,0.0,,
+Plugin06,SpringRotationFinalSuiteTool,19,cache_mode,GPString,Optional,no,NEAR_ONLY,,NEAR_ONLY|ALL
+Plugin06,SpringRotationFinalSuiteTool,20,profile,GPBoolean,Optional,no,False,,
+Plugin06,SpringRotationFinalSuiteTool,21,run_01,GPBoolean,Optional,no,True,creates ROT/OK/NOTE,NearTangent
+Plugin06,SpringRotationFinalSuiteTool,22,run_02,GPBoolean,Optional,no,True,,HighLow
+Plugin06,SpringRotationFinalSuiteTool,23,run_03,GPBoolean,Optional,no,False,,NearNormal
+Plugin06,SpringRotationFinalSuiteTool,24,run_04,GPBoolean,Optional,no,False,,PlaneFit
+Plugin06,SpringRotationFinalSuiteTool,25,run_05,GPBoolean,Optional,no,False,,CentroidHL
+Plugin07,BatchGridBuilder07,0,mode,GPString,Required,no,FOLDER_OF_MXDS,,FOLDER_OF_MXDS|AOI_LAYER_IN_CURRENT_MXD
+Plugin07,BatchGridBuilder07,1,mxd_folder,DEFolder,Optional,no,,,for FOLDER_OF_MXDS
+Plugin07,BatchGridBuilder07,2,recursive,GPBoolean,Optional,no,False,,
+Plugin07,BatchGridBuilder07,3,data_frame_name,GPString,Optional,no,,,default=first DF
+Plugin07,BatchGridBuilder07,4,aoi_layer,GPFeatureLayer,Optional,no,,,for AOI_LAYER_IN_CURRENT_MXD
+Plugin07,BatchGridBuilder07,5,aoi_name_field,Field,Optional,no,,,depends on aoi_layer
+Plugin07,BatchGridBuilder07,6,engine,GPString,Required,no,SMART_FEATURE,,SMART_FEATURE|ESRI_XML
+Plugin07,BatchGridBuilder07,7,grid_xml,DEFile,Optional,no,,,for ESRI_XML
+Plugin07,BatchGridBuilder07,8,out_ws,DEWorkspace,Required,no,,,
+Plugin07,BatchGridBuilder07,9,fds_name,GPString,Optional,no,Grids,creates feature dataset,
+Plugin07,BatchGridBuilder07,10,refscale_denom,GPDouble,Required,no,25000,,
+Plugin07,BatchGridBuilder07,11,respect_df_rotation,GPBoolean,Optional,no,True,,
+Plugin07,BatchGridBuilder07,12,spacing_proj,GPDouble,Optional,no,1000.0,,projected grid interval
+Plugin07,BatchGridBuilder07,13,divisor_proj,GPDouble,Optional,no,1000.0,,label divisor
+Plugin07,BatchGridBuilder07,14,tick_mm,GPDouble,Optional,no,1.5,,
+Plugin07,BatchGridBuilder07,15,label_mm,GPDouble,Optional,no,3.0,,
+Plugin07,BatchGridBuilder07,16,create_grid_lines,GPBoolean,Optional,no,True,creates grid lines,(further graticule params follow with defaults)

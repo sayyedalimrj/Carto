@@ -1,0 +1,20 @@
+role,selected_layer,fallback_layer,confidence,reason,geometry_type,record_count,required_fields_found,missing_fields,notes
+road_any,,,,manual override example,Polyline,,,,Set selected_layer to force a specific road layer
+road_asphalt,,,,,Polyline,,,,
+road_dirt,,,,,Polyline,,,,
+road_track,,,,,Polyline,,,,
+watercourse,,,,,Polyline,,,,
+canal,,,,,Polyline,,,,
+river_line,,,,,Polyline,,,,
+contour_interval,,,,,Polyline,,,,
+contour_index,,,,,Polyline,,,,
+elevation_points,,,,,Point,,,,
+elevation_text_anno,,,,,Polygon,,,,
+contour_index_anno,,,,,Polygon,,,,
+bridge_existing,,,,,Point,,,,
+spring,,,,,Point,,,,
+powerline,,,,,Polyline,,,,
+building,,,,,Polygon,,,,
+point_obstacle,,,,,Point,,,,
+aoi_frame,,,,,Polygon,,,,T00_TestFrame synthesized if no polygon AOI exists
+dem_raster,,,,,Raster,,,,

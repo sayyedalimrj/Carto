@@ -1,0 +1,1 @@
+plugin_id,plugin_name,platform,test_name,test_type,input_layers,output_layers,parameters_used,start_time,end_time,elapsed_seconds,status,skip_reason,error_message,traceback,arcpy_messages,before_feature_count,after_feature_count,changed_feature_count,geometry_validity_result,spatial_reference_check,field_schema_check,success_metrics,notes,active_workspace,plugin_path
