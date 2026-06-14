@@ -2,9 +2,9 @@
 
 Source geodatabase: `Test_Cartography1.gdb`
 Spatial reference: **WGS_1984_UTM_Zone_38N (WKID 32638, meters)** for all feature classes.
-Datasets: **136** feature classes across feature datasets (Structures, Transportation, Hydrology, Building, Boundary, Urban_Facilities, Elevation_Features, Unknown_Features).
+Datasets: **136** feature classes.
 
-> NOTE: geometry type, Z/M, fields, nullability, parent dataset and spatial reference below are AUTHORITATIVE (read directly from the file geodatabase system table `GDB_Items`). **Record counts and sample records are computed at run time** by the harness (`arcpy.GetCount` + `SearchCursor`) and written into each run's `reports/MAP_DATA_INVENTORY.csv`; they are left blank here because arcpy was not available at authoring time.
+> Geometry/Z/M/fields/parent/SR below are AUTHORITATIVE (read from `GDB_Items`). Record counts and samples are computed at run time by the harness.
 
 | Name | Parent dataset | Geom | Z | M | Anno | Elevation fields | Angle fields | Type/Code fields |
 |------|----------------|------|---|---|------|------------------|--------------|------------------|

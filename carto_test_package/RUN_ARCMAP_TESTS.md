@@ -38,8 +38,20 @@ C:\Python27\ArcGIS10.6\python.exe ^
 | `--plugins Plugin01,Plugin06` | run only some plugins |
 | `--test-types smoke,functional` | run only some test types (smoke/functional/edge/regression) |
 | `--mxd-folder "C:\sheets"` | enable Plugin 07 `FOLDER_OF_MXDS` mode (folder of `.mxd`) |
-| `--role-map-csv "C:\my_roles.csv"` | manual layer-role override |
+| `--role-map-csv "C:\my_roles.csv"` | manual layer-role override (columns `role,layer_name,notes`); example at `common\layer_role_override_example.csv` |
+| `--role-map-json "C:\my_roles.json"` | manual layer-role override via JSON |
 | `--unsafe` | (not recommended) disable the safe-mode guard |
+
+### Manual layer-role override
+
+The corrected defaults select `Bridge_P`, `Watercourse`, `Track_Road`,
+`Dirt_Road`, `Asphalt_Road1_lin`, and synthesize `T00_TestFrame`. To force a
+different layer, pass `--role-map-csv` (columns `role,layer_name,notes`):
+
+```bat
+... run_all_carto_tests_arcmap.py --input-gdb ... --carto-repo ... --output ... ^
+  --role-map-csv "<pkg>\common\layer_role_override_example.csv"
+```
 
 ## 3. Toolbox run (inside ArcMap, with a map - needed for full Plugin 07)
 
@@ -77,5 +89,13 @@ active map). The suite always continues to the next plugin after a failure.
 * Plugin 03's annotation tool (`AutoGenerateAnnotation`) is ArcMap-only and
   requires `arcpy.mapping`; the suite tests the platform-neutral optimizer tool.
 * Plugin 05 `Segment Erase` needs an Advanced license; the suite auto-retries
-  with `Delete Whole Features` and records which method ran.
+  with `Delete Whole Features` and records which method ran. Frame-edge contours
+  are checked for protection (FAIL if removed), and a "protected contours are
+  never removed" regression validates the protected-SQL mechanism that also
+  guards index contours.
+* **Plugin 07 needs a map context.** In a standalone run it is reported as SKIP
+  with an explicit message. To run it: (1) open this `.pyt` harness
+  (`Carto_ArcMap_TestHarness.pyt`) inside ArcMap with `T07_test_sheets` added to
+  the map (AOI_LAYER mode), or (2) pass `--mxd-folder` pointing to a folder of
+  `.mxd` documents (FOLDER_OF_MXDS mode).
 * Map add-ins / symbology are disabled (`add_map=False`) so the run is headless-safe.

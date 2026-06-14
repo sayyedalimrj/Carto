@@ -21,3 +21,24 @@ The generated summary contains:
 | SKIP | Pre-conditions not met (missing layer/field, or environment cannot run the tool, e.g. Plugin 07 with no active map). `skip_reason` explains why. |
 
 The per-test schema is documented in `common/test_schema.json`.
+
+## Corrected layer-role mappings (this dataset)
+
+The role detection defaults were corrected so the primary test layers are:
+
+| Role | Selected layer | Fallback(s) |
+|------|----------------|-------------|
+| bridge_existing | `Bridge_P` | `Bridge` |
+| watercourse | `Watercourse` | - |
+| drainage_any | `Watercourse` | `Canal`, `River_L` |
+| road_any | `Dirt_Road` | `Track_Road`, others |
+| road_track | `Track_Road` | - |
+| road_asphalt | `Asphalt_Road1_lin` | `Asphalt_Road2_lin` |
+| aoi_frame | *(none in data -> synthesize `T00_TestFrame`)* | - |
+
+Plugin 01 now tests road x **Watercourse**, road x **Canal**, and road x
+**River_L** when those layers exist, recording per-drainage intersection /
+bridge counts and angle validity. Override any role with
+`--role-map-csv` (columns `role,layer_name,notes`) or `--role-map-json`; an
+example is at `common/layer_role_override_example.csv`.
+

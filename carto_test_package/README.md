@@ -27,6 +27,7 @@ carto_test_package/
     report_writer.py            <- JSON / CSV / Markdown reports
     test_schema.json            <- per-test-case record schema
     layer_role_mapping_template.csv
+    layer_role_override_example.csv  <- ready-to-use role override (CSV)
     plugin_parameter_template.json
 
   tests_arcmap/                 <- ArcMap (Python 2.7) harness
@@ -81,6 +82,20 @@ timestamped folder with *live* reports (real counts, real PASS/FAIL):
 > Bridge symbol *rotation* is tested under **T01** (Plugin 01's rotate tools);
 > spring symbol *rotation* is tested under **T06** (Plugin 06).
 
+### Plugin 07 (Batch Grid Builder) needs a map context
+
+Plugin 07 cannot run fully headless. In a standalone run it is reported as
+**SKIP** with an explicit message. To actually run it, choose one of:
+
+1. Run the `.pyt` TestHarness **inside an active ArcMap / ArcGIS Pro session**
+   (the harness detects the CURRENT map and uses `AOI_LAYER_IN_CURRENT_MXD` with
+   the prepared `T01..T07` sheet polygons). Add `test_data.gdb/T07_test_sheets`
+   to the active map.
+2. Pass `--mxd-folder` pointing to a folder of ArcMap `.mxd` documents
+   (`FOLDER_OF_MXDS` mode).
+3. Pass `--mxd-folder` pointing to a folder of ArcGIS Pro `.aprx` projects
+   (`FOLDER_OF_MXDS` mode in Pro).
+
 ---
 
 ## Quick start
@@ -123,16 +138,34 @@ Open `<run_dir>/reports/ALL_TEST_SUMMARY.md`.
 
 ## Overriding layer detection
 
-The harness auto-detects roles (see `reports/LAYER_ROLE_MAPPING.md`). To force a
-specific layer for a role:
+The harness auto-detects roles (see `reports/LAYER_ROLE_MAPPING.md`). The
+corrected defaults for this dataset are: `bridge_existing=Bridge_P`,
+`watercourse`/`drainage_any=Watercourse` (with `Canal`/`River_L` as fallbacks),
+`road_track=Track_Road`, `road_any=Dirt_Road` (a real road, never `Path_Lin`),
+`road_asphalt=Asphalt_Road1_lin`, and `aoi_frame` synthesized as `T00_TestFrame`
+when no polygon AOI exists.
 
-1. Copy `common/layer_role_mapping_template.csv`, fill `role,selected_layer`.
-2. Pass it: `--role-map-csv "C:\path\my_roles.csv"`.
+To force a specific layer for a role, use **either** a CSV or a JSON override:
 
-Valid roles include: `road_any`, `road_asphalt`, `road_dirt`, `road_track`,
-`watercourse`, `canal`, `river_line`, `drainage_any`, `contour_interval`,
-`contour_index`, `elevation_points`, `bridge_existing`, `spring_continual`,
-`powerline`, `building_poly`, `point_obstacle`, `aoi_frame`, `dem_raster`.
+* CSV (`--role-map-csv`): columns `role,layer_name,notes`. A ready-made example
+  is provided at `common/layer_role_override_example.csv`:
+
+  ```bash
+  --role-map-csv common/layer_role_override_example.csv
+  ```
+
+  (The legacy column name `selected_layer` is still accepted for backward
+  compatibility.)
+
+* JSON (`--role-map-json`): either `{"role": "layer_name", ...}` or
+  `{"overrides": [{"role": "...", "layer_name": "...", "notes": "..."}]}`.
+
+An overridden layer must exist in the scanned inventory; unknown layers are
+logged and skipped (never silently ignored). Valid roles include: `road_any`,
+`road_asphalt`, `road_dirt`, `road_track`, `watercourse`, `canal`, `river_line`,
+`drainage_any`, `contour_interval`, `contour_index`, `elevation_points`,
+`bridge_existing`, `spring_continual`, `powerline`, `building_poly`,
+`point_obstacle`, `aoi_frame`, `dem_raster`.
 
 ## Overriding plugin parameters
 

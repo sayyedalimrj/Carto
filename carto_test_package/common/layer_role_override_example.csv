@@ -1,0 +1,8 @@
+role,layer_name,notes
+bridge_existing,Bridge_P,Use point bridge layer for bridge rotation and culvert tests
+watercourse,Watercourse,Primary watercourse layer for road-water intersection tests
+drainage_any,Watercourse,Prefer natural watercourses over canal-only tests
+road_track,Track_Road,Use real track road layer instead of Path_Lin
+road_any,Dirt_Road,Primary road layer for broad road conflict tests
+road_asphalt,Asphalt_Road1_lin,Asphalt road layer
+road_dirt,Dirt_Road,Dirt road layer

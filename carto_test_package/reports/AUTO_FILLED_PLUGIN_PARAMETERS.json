@@ -1,14 +1,15 @@
 {
-  "_comment": "STATIC PREVIEW of auto-filled parameters, derived from layer-role detection on Test_Cartography1.gdb. The harness regenerates an authoritative copy at run time into <run_dir>/reports/AUTO_FILLED_PLUGIN_PARAMETERS.json (with runtime-confirmed layer selection, e.g. Bridge_P over empty Bridge). Parameters are an ORDERED list because tools are invoked positionally. source = code_default | detected_layer | generated_test_layer | user_required. Tests staging copies the detected source layer into test_data.gdb under the T0x name shown in 'value'.",
+  "_comment": "STATIC PREVIEW of auto-filled parameters, derived from CORRECTED layer-role detection on Test_Cartography1.gdb. The harness regenerates an authoritative copy at run time into <run_dir>/reports/AUTO_FILLED_PLUGIN_PARAMETERS.json. Corrected preferred mappings: bridge_existing=Bridge_P, watercourse/drainage_any=Watercourse (Canal & River_L as fallbacks), road_track=Track_Road, road_any=Dirt_Road (real road, not Path_Lin), road_asphalt=Asphalt_Road1_lin, frame=T00_TestFrame (synthesized; dataset AOI is a polyline). Parameters are an ORDERED list because tools are invoked positionally. source = code_default | detected_layer | generated_test_layer | user_required. Override via --role-map-csv (columns role,layer_name,notes) or --role-map-json; see common/layer_role_override_example.csv.",
   "spatial_reference": "WGS_1984_UTM_Zone_38N (WKID 32638, meters)",
   "Plugin01": {
     "ArcMap":    {"tool_path": "<carto-repo>/Plugin01_BridgeCulvert_ArcMap_py27.pyt", "alias": "bridgeCulvertArcMap", "tool_class": "BuildBridgePoints"},
     "ArcGISPro": {"tool_path": "<carto-repo>/Plugin01_BridgeCulvert_Pro_py3.pyt",    "alias": "bridgeCulvertPro",    "tool_class": "BuildBridgePoints"},
+    "drainage_layers_tested": ["Watercourse", "Canal", "River_L"],
     "parameters": [
-      {"name": "roads",    "value": "T01_roads (<- Dirt_Road/Track_Road)", "source": "detected_layer",       "confidence": 0.9, "notes": "role road_any"},
-      {"name": "drains",   "value": "T01_drains (<- Watercourse/Canal)",  "source": "detected_layer",       "confidence": 0.9, "notes": "role drainage_any"},
-      {"name": "out_ws",   "value": "result_data.gdb",                    "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
-      {"name": "out_name", "value": "T01_bridge_after",                   "source": "code_default",         "confidence": 1.0, "notes": ""},
+      {"name": "roads",    "value": "T01_roads (<- Dirt_Road)",        "source": "detected_layer",       "confidence": 0.81, "notes": "role road_any -> Dirt_Road (fallback Track_Road)"},
+      {"name": "drains",   "value": "T01_drains (<- Watercourse)",     "source": "detected_layer",       "confidence": 0.81, "notes": "primary=Watercourse; functional matrix also tests Canal and River_L"},
+      {"name": "out_ws",   "value": "result_data.gdb",                 "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "out_name", "value": "T01_bridge_after",                "source": "code_default",         "confidence": 1.0, "notes": "per-drainage outputs: T01_bridge_after_<drainage>"},
       {"name": "sample_m", "value": 8.0,        "source": "code_default", "confidence": 1.0, "notes": ""},
       {"name": "rot_field","value": "ROTATION", "source": "code_default", "confidence": 1.0, "notes": ""},
       {"name": "rot_type", "value": "GEOGRAPHIC","source": "code_default","confidence": 1.0, "notes": ""},
@@ -16,7 +17,7 @@
       {"name": "tmpl_lyr", "value": null,       "source": "user_required","confidence": 1.0, "notes": "optional .lyr"},
       {"name": "end_tol",  "value": 2.0,        "source": "code_default", "confidence": 1.0, "notes": ""}
     ],
-    "rotate_existing_note": "RotateExistingBridgePoints uses Bridge_P (populated) as in_pts, ref=T01_roads, upd_mode=COPY_TO_OUTPUT, rot_field=ROTATION."
+    "rotate_existing_note": "RotateExistingBridgePoints uses Bridge_P (point bridge layer, preferred over generic Bridge) as in_pts, ref=T01_roads, upd_mode=COPY_TO_OUTPUT, rot_field=ROTATION. Regression asserts bridge count is unchanged (no add/delete) and ROTATION values are valid 0-360."
   },
   "Plugin02": {
     "ArcMap":    {"tool_path": "<carto-repo>/Plugin02_RoadDeconflict_ArcMap_v5_hardened.pyt", "alias": "plugin2_road_deconflict_arcmap_v6", "tool_class": "RoadDeconflictTool"},
