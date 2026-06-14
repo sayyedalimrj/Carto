@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "description": "Per-test-case record schema for the Carto plugin test framework. Every test case emitted by the ArcMap (Py2.7) and ArcGIS Pro (Py3) harnesses conforms to this schema. Written to reports/ALL_TEST_RESULTS.json and reports/ALL_TEST_RESULTS.csv.",
+  "test_case_fields": [
+    {"name": "plugin_id",               "type": "string",  "notes": "Plugin01 .. Plugin07"},
+    {"name": "plugin_name",             "type": "string"},
+    {"name": "platform",                "type": "string",  "enum": ["ArcMap", "ArcGISPro"]},
+    {"name": "test_name",               "type": "string"},
+    {"name": "test_type",               "type": "string",  "enum": ["smoke", "functional", "edge", "regression"]},
+    {"name": "input_layers",            "type": "list[string]"},
+    {"name": "output_layers",           "type": "list[string]"},
+    {"name": "parameters_used",         "type": "object"},
+    {"name": "start_time",              "type": "string",  "notes": "ISO 8601"},
+    {"name": "end_time",                "type": "string",  "notes": "ISO 8601"},
+    {"name": "elapsed_seconds",         "type": "number"},
+    {"name": "status",                  "type": "string",  "enum": ["PASS", "FAIL", "WARN", "SKIP"]},
+    {"name": "skip_reason",             "type": "string"},
+    {"name": "error_message",           "type": "string"},
+    {"name": "traceback",               "type": "string"},
+    {"name": "arcpy_messages",          "type": "string"},
+    {"name": "before_feature_count",    "type": "integer"},
+    {"name": "after_feature_count",     "type": "integer"},
+    {"name": "changed_feature_count",   "type": "integer"},
+    {"name": "geometry_validity_result","type": "string"},
+    {"name": "spatial_reference_check", "type": "string"},
+    {"name": "field_schema_check",      "type": "string"},
+    {"name": "success_metrics",         "type": "object"},
+    {"name": "notes",                   "type": "string"},
+    {"name": "active_workspace",        "type": "string"},
+    {"name": "plugin_path",             "type": "string"}
+  ],
+  "status_semantics": {
+    "PASS": "Tool ran and all assertions for the test case were satisfied.",
+    "FAIL": "Tool ran but one or more assertions failed, OR the tool crashed unexpectedly.",
+    "WARN": "Tool ran and produced output, but a soft check (non-blocking) was not satisfied (e.g. no measurable change where some was expected, or an optional metric out of preferred band).",
+    "SKIP": "Pre-conditions not met (missing layer/parameter, environment not capable, e.g. Plugin07 needs an active map document). skip_reason explains why."
+  }
+}

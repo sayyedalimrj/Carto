@@ -1,0 +1,127 @@
+{
+  "_comment": "STATIC PREVIEW of auto-filled parameters, derived from layer-role detection on Test_Cartography1.gdb. The harness regenerates an authoritative copy at run time into <run_dir>/reports/AUTO_FILLED_PLUGIN_PARAMETERS.json (with runtime-confirmed layer selection, e.g. Bridge_P over empty Bridge). Parameters are an ORDERED list because tools are invoked positionally. source = code_default | detected_layer | generated_test_layer | user_required. Tests staging copies the detected source layer into test_data.gdb under the T0x name shown in 'value'.",
+  "spatial_reference": "WGS_1984_UTM_Zone_38N (WKID 32638, meters)",
+  "Plugin01": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin01_BridgeCulvert_ArcMap_py27.pyt", "alias": "bridgeCulvertArcMap", "tool_class": "BuildBridgePoints"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin01_BridgeCulvert_Pro_py3.pyt",    "alias": "bridgeCulvertPro",    "tool_class": "BuildBridgePoints"},
+    "parameters": [
+      {"name": "roads",    "value": "T01_roads (<- Dirt_Road/Track_Road)", "source": "detected_layer",       "confidence": 0.9, "notes": "role road_any"},
+      {"name": "drains",   "value": "T01_drains (<- Watercourse/Canal)",  "source": "detected_layer",       "confidence": 0.9, "notes": "role drainage_any"},
+      {"name": "out_ws",   "value": "result_data.gdb",                    "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "out_name", "value": "T01_bridge_after",                   "source": "code_default",         "confidence": 1.0, "notes": ""},
+      {"name": "sample_m", "value": 8.0,        "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "rot_field","value": "ROTATION", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "rot_type", "value": "GEOGRAPHIC","source": "code_default","confidence": 1.0, "notes": ""},
+      {"name": "add_map",  "value": false,      "source": "code_default", "confidence": 1.0, "notes": "headless"},
+      {"name": "tmpl_lyr", "value": null,       "source": "user_required","confidence": 1.0, "notes": "optional .lyr"},
+      {"name": "end_tol",  "value": 2.0,        "source": "code_default", "confidence": 1.0, "notes": ""}
+    ],
+    "rotate_existing_note": "RotateExistingBridgePoints uses Bridge_P (populated) as in_pts, ref=T01_roads, upd_mode=COPY_TO_OUTPUT, rot_field=ROTATION."
+  },
+  "Plugin02": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin02_RoadDeconflict_ArcMap_v5_hardened.pyt", "alias": "plugin2_road_deconflict_arcmap_v6", "tool_class": "RoadDeconflictTool"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin02_RoadDeconflict_Pro_v5_native.pyt",      "alias": "plugin2_road_deconflict_pro",      "tool_class": "RoadDeconflictTool"},
+    "parameters": [
+      {"name": "in_roads",   "value": "T02_roads (<- Dirt_Road)", "source": "detected_layer", "confidence": 0.9, "notes": "barrier"},
+      {"name": "clearance",  "value": 6.0,   "source": "code_default", "confidence": 1.0, "notes": "map units"},
+      {"name": "in_points",  "value": "T02_points (<- Tower/Mine/Well)", "source": "detected_layer", "confidence": 0.7, "notes": "role point_obstacle"},
+      {"name": "in_lines",   "value": "T02_lines (<- HV_Line/Power_Trans_Line)", "source": "detected_layer", "confidence": 0.6, "notes": "role powerline"},
+      {"name": "in_polygons","value": "T02_polys (<- Building_Area)", "source": "detected_layer", "confidence": 0.6, "notes": "role building_poly"},
+      {"name": "out_gdb",    "value": "result_data.gdb", "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "name_suffix","value": "_RDCL", "source": "code_default", "confidence": 1.0, "notes": "outputs <name>_RDCL"},
+      {"name": "aoi_poly",   "value": null,    "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "line_strategy","value": "LOCAL_PUSH", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "offset_side","value": "AUTO", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "densify_step","value": 0.0,   "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "preserve_endpoints","value": true, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "smooth_iters","value": 0,     "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "max_shift",  "value": 0.0,    "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "max_iter",   "value": 8,      "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "max_deflection_deg","value": 25.0, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "use_near",   "value": true,   "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "lock_field", "value": null,   "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "create_errors","value": true, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "create_vectors","value": true,"source": "code_default", "confidence": 1.0, "notes": "QC vectors"},
+      {"name": "write_csv",  "value": true,   "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "keep_near_fields","value": false, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "near_chunk_size","value": 50000, "source": "code_default", "confidence": 1.0, "notes": ""}
+    ]
+  },
+  "Plugin03": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin03_ContourLabelOptimizer_ArcMap_v4_hardened.pyt", "alias": "contourlabelopt5_arcmap", "tool_class": "OptimizeContourLabelAnchorsV4"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin03_ContourLabelOptimizer_Pro_v4_native.pyt",      "alias": "contourlabelopt4_pro",   "tool_class": "OptimizeContourLabelAnchorsV4"},
+    "parameters": [
+      {"name": "in_contours", "value": "T03_contour_interval (<- Contour_Interval)", "source": "detected_layer", "confidence": 0.9, "notes": ""},
+      {"name": "elev_field",  "value": "Ortho_Hght", "source": "detected_layer", "confidence": 0.9, "notes": "numeric"},
+      {"name": "selection_mode","value": "ALL", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "interval_m",  "value": 500.0, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "safe_mm",     "value": 2.0,   "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "map_scale",   "value": 25000.0, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "obstacles",   "value": "T03_obstacles_road;T03_obstacles_water (<- Dirt_Road;Watercourse)", "source": "detected_layer", "confidence": 0.7, "notes": ""},
+      {"name": "out_ws",      "value": "result_data.gdb", "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "out_segments_name", "value": "T03_seg_interval", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "out_points_name",   "value": "T03_contour_candidates", "source": "code_default", "confidence": 1.0, "notes": "remaining 24 params use code defaults"}
+    ]
+  },
+  "Plugin04": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin04_ElevationTextDeconflict_ArcMap_v5_hardened.pyt", "alias": "elevtext_v6_arcmap", "tool_class": "ElevationTextDeconflictV5"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin04_ElevationTextDeconflict_Pro_v5_native.pyt",      "alias": "elevtext_pro",      "tool_class": "ElevationTextDeconflictV5"},
+    "parameters": [
+      {"name": "input_mode",  "value": "POINT_LAYER_WITH_TEXT_FIELD", "source": "code_default", "confidence": 1.0, "notes": "Mode A"},
+      {"name": "in_points",   "value": "T04_elevation_text_before (<- Elevation_Points)", "source": "detected_layer", "confidence": 0.75, "notes": ""},
+      {"name": "text_field",  "value": "Ortho_Hght", "source": "detected_layer", "confidence": 0.9, "notes": ""},
+      {"name": "rings",       "value": "2 4 6", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "directions",  "value": 16, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "obstacle_layers", "value": "T04_contours;T04_contour_index (<- Contour_Interval;Contour_Index)", "source": "detected_layer", "confidence": 0.8, "notes": "REQUIRED"},
+      {"name": "conflict_test_mode", "value": "BALANCED_EXTENT_THEN_GEOMETRY", "source": "code_default", "confidence": 1.0, "notes": "remaining params use code defaults"}
+    ]
+  },
+  "Plugin05": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin05_SafeContourCleaner_ArcMap_v5_hardened.pyt", "alias": "carto_auto_arcmap_v5", "tool_class": "SafeContourCleaner"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin05_SafeContourCleaner_Pro_v5_native.pyt",      "alias": "carto_auto_pro_v5",   "tool_class": "SafeContourCleaner"},
+    "parameters": [
+      {"name": "in_contours", "value": "T05_dense_contours_before (<- Contour_Interval)", "source": "detected_layer", "confidence": 0.9, "notes": ""},
+      {"name": "frame_polygon","value": "T00_TestFrame", "source": "generated_test_layer", "confidence": 1.0, "notes": "synthesized: dataset AOI is a polyline, not a polygon"},
+      {"name": "dense_threshold","value": 20.0, "source": "code_default", "confidence": 1.0, "notes": "map units"},
+      {"name": "aoi_mode",    "value": "Frame only (default)", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "mask_mode",   "value": "Auto mask from dense zones (recommended)", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "removal_method","value": "Segment Erase (recommended)", "source": "code_default", "confidence": 1.0, "notes": "falls back to Delete Whole Features if no Advanced license"},
+      {"name": "out_workspace","value": "result_data.gdb", "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "out_clean_name","value": "T05_dense_contours_after", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "add_to_map",  "value": false, "source": "code_default", "confidence": 1.0, "notes": "headless; remaining params use code defaults"},
+      {"name": "allow_full_map_processing","value": false, "source": "code_default", "confidence": 1.0, "notes": ""}
+    ]
+  },
+  "Plugin06": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin06_SpringRotation_ArcMap_v4_hardened.pyt", "alias": "SpringRotationSuiteV4",    "tool_class": "SpringRotationFinalSuiteTool"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin06_SpringRotation_Pro_v4_native.pyt",      "alias": "SpringRotationSuiteProV4", "tool_class": "SpringRotationFinalSuiteTool"},
+    "parameters": [
+      {"name": "springs",   "value": "T06_spring_before (<- Continual_Spring)", "source": "detected_layer", "confidence": 0.9, "notes": ""},
+      {"name": "contours",  "value": "T06_contours (<- Contour_Interval)", "source": "detected_layer", "confidence": 0.9, "notes": ""},
+      {"name": "elev_field","value": "Ortho_Hght", "source": "detected_layer", "confidence": 0.9, "notes": "numeric"},
+      {"name": "ignore_selection","value": true, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "out_gdb",   "value": "result_data.gdb", "source": "generated_test_layer", "confidence": 1.0, "notes": "must already exist"},
+      {"name": "out_base_name","value": "T06_spring", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "work_sr_mode","value": "AUTO_UTM", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "near_method","value": "PLANAR", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "auto_symbology","value": false, "source": "code_default", "confidence": 1.0, "notes": "headless"},
+      {"name": "run_01",    "value": true, "source": "code_default", "confidence": 1.0, "notes": "NearTangent"},
+      {"name": "run_02",    "value": true, "source": "code_default", "confidence": 1.0, "notes": "HighLow; remaining params use code defaults"}
+    ]
+  },
+  "Plugin07": {
+    "ArcMap":    {"tool_path": "<carto-repo>/Plugin07_BatchGridBuilder_ArcMap_v6_hardened.pyt", "alias": "plugin07_batch_grid_v6",     "tool_class": "BatchGridBuilder07"},
+    "ArcGISPro": {"tool_path": "<carto-repo>/Plugin07_BatchGridBuilder_Pro_v6_native.pyt",      "alias": "plugin07_batch_grid_pro_v6", "tool_class": "BatchGridBuilder07"},
+    "parameters": [
+      {"name": "mode",        "value": "AOI_LAYER_IN_CURRENT_MXD", "source": "user_required", "confidence": 0.5, "notes": "needs CURRENT map; or FOLDER_OF_MXDS with --mxd-folder"},
+      {"name": "aoi_layer",   "value": "T07_test_sheets", "source": "generated_test_layer", "confidence": 1.0, "notes": "synthetic 2x2 sheet polygons"},
+      {"name": "aoi_name_field","value": "SHEET", "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "engine",      "value": "SMART_FEATURE", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "out_ws",      "value": "result_data.gdb", "source": "generated_test_layer", "confidence": 1.0, "notes": ""},
+      {"name": "fds_name",    "value": "Grids", "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "refscale_denom","value": 25000.0, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "spacing_proj","value": 1000.0, "source": "code_default", "confidence": 1.0, "notes": ""},
+      {"name": "create_grid_lines","value": true, "source": "code_default", "confidence": 1.0, "notes": "SKIP in standalone (no CURRENT map)"}
+    ]
+  }
+}

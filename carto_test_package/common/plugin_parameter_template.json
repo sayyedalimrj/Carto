@@ -1,0 +1,27 @@
+{
+  "_comment": "Template for manual override of auto-filled plugin parameters. Copy a block into reports/AUTO_FILLED_PLUGIN_PARAMETERS.json (or pass via --params-json) to force specific values. 'parameters' is an ORDERED list because Carto tools are invoked positionally via arcpy.ImportToolbox. Each entry: name, datatype, value, source, confidence, notes. Use null for an unset optional. Use ';'-joined string for multiValue parameters.",
+  "Plugin01": {
+    "tool_class": "BuildBridgePoints",
+    "ArcMap": {
+      "tool_path": "<carto-repo>/Plugin01_BridgeCulvert_ArcMap_py27.pyt",
+      "alias": "bridgeCulvertArcMap",
+      "parameters": [
+        {"name": "roads",     "datatype": "GPFeatureLayer(mv)", "value": null, "source": "detected_layer",        "confidence": 0.0, "notes": "road layer(s), ';'-joined"},
+        {"name": "drains",    "datatype": "GPFeatureLayer(mv)", "value": null, "source": "detected_layer",        "confidence": 0.0, "notes": "watercourse/canal/river"},
+        {"name": "out_ws",    "datatype": "DEWorkspace",        "value": null, "source": "generated_test_layer",  "confidence": 1.0, "notes": "result_data.gdb"},
+        {"name": "out_name",  "datatype": "GPString",           "value": "T01_bridge_after", "source": "code_default", "confidence": 1.0, "notes": ""},
+        {"name": "sample_m",  "datatype": "GPDouble",           "value": 8.0,  "source": "code_default",          "confidence": 1.0, "notes": ""},
+        {"name": "rot_field", "datatype": "GPString",           "value": "ROTATION", "source": "code_default",     "confidence": 1.0, "notes": ""},
+        {"name": "rot_type",  "datatype": "GPString",           "value": "GEOGRAPHIC", "source": "code_default",   "confidence": 1.0, "notes": ""},
+        {"name": "add_map",   "datatype": "GPBoolean",          "value": false,"source": "code_default",          "confidence": 1.0, "notes": "off for headless"},
+        {"name": "tmpl_lyr",  "datatype": "DEFile",             "value": null, "source": "user_required",         "confidence": 1.0, "notes": "optional .lyr"},
+        {"name": "end_tol",   "datatype": "GPDouble",           "value": 2.0,  "source": "code_default",          "confidence": 1.0, "notes": ""}
+      ]
+    },
+    "ArcGISPro": {
+      "tool_path": "<carto-repo>/Plugin01_BridgeCulvert_Pro_py3.pyt",
+      "alias": "bridgeCulvertPro",
+      "parameters": "same order as ArcMap"
+    }
+  }
+}
