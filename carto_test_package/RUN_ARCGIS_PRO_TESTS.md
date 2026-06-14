@@ -36,8 +36,20 @@ env's `python.exe`.)
 | `--plugins Plugin01,Plugin06` | run only some plugins |
 | `--test-types smoke,functional` | run only some test types |
 | `--mxd-folder "C:\projects"` | enable Plugin 07 `FOLDER_OF_MXDS` mode (folder of `.aprx`) |
-| `--role-map-csv "C:\my_roles.csv"` | manual layer-role override |
+| `--role-map-csv "C:\my_roles.csv"` | manual layer-role override (columns `role,layer_name,notes`); example at `common\layer_role_override_example.csv` |
+| `--role-map-json "C:\my_roles.json"` | manual layer-role override via JSON |
 | `--unsafe` | (not recommended) disable the safe-mode guard |
+
+### Manual layer-role override
+
+The corrected defaults select `Bridge_P`, `Watercourse`, `Track_Road`,
+`Dirt_Road`, `Asphalt_Road1_lin`, and synthesize `T00_TestFrame`. To force a
+different layer:
+
+```bat
+... run_all_carto_tests_pro.py --input-gdb ... --carto-repo ... --output ... ^
+  --role-map-csv "<pkg>\common\layer_role_override_example.csv"
+```
 
 ## 3. Toolbox run (inside Pro, with a project/map - needed for full Plugin 07)
 
@@ -66,7 +78,13 @@ tools (Plugin 03 annotation; Plugin 07 export).
 
 * Plugin 03's annotation tool in Pro is `ConvertLabelsToAnnotationPro`
   (`arcpy.mp`); the suite tests the shared `OptimizeContourLabelAnchorsV4`.
-* Plugin 07 uses `arcpy.mp.ArcGISProject`; for `FOLDER_OF_MXDS` mode pass a folder
-  of `.aprx` projects with `--mxd-folder`.
+* Plugin 05 frame-edge protection is checked (FAIL if frame-edge contours are
+  removed), plus a "protected contours are never removed" regression that
+  validates the protected-SQL mechanism used to guard index contours.
+* **Plugin 07 needs a map context.** In a standalone run it is reported as SKIP
+  with an explicit message. To run it: (1) open this `.pyt` harness
+  (`Carto_Pro_TestHarness.pyt`) inside ArcGIS Pro with `T07_test_sheets` added
+  to the active map (AOI_LAYER mode), or (2) pass `--mxd-folder` pointing to a
+  folder of `.aprx` projects (FOLDER_OF_MXDS mode).
 * `arcpy.mp` is used only for map detection/add; tool runs are headless-safe
   (`auto_symbology`/`add_to_map` disabled).

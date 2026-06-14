@@ -10,7 +10,7 @@ between ArcMap and Pro:
   * locating the shared 'common' package on sys.path,
   * detecting whether an active ArcMap map document is available
     (so Plugin07 can run in AOI_LAYER_IN_CURRENT_MXD mode),
-  * a thin, defensive add-to-map helper (arcpy.mapping, with arcpy.mp fallback).
+  * a thin add-to-map helper (arcpy.mapping only - never arcpy.mp).
 
 It is intentionally written for Python 2.7: no f-strings, no pathlib,
 no Py3-only syntax.
@@ -32,6 +32,9 @@ def add_common_to_path():
 def detect_active_map(arcpy):
     """Return True when a CURRENT ArcMap document (or Pro project) is available."""
     # ArcMap path
+def detect_active_map(arcpy):
+    """Return True when a CURRENT ArcMap map document is available.
+    ArcMap-only: uses arcpy.mapping (never arcpy.mp)."""
     try:
         import arcpy.mapping as mapping
         mxd = mapping.MapDocument("CURRENT")
@@ -40,20 +43,12 @@ def detect_active_map(arcpy):
             return True
     except Exception:
         pass
-    # If someone loaded this in Pro by mistake, try arcpy.mp
-    try:
-        aprx = arcpy.mp.ArcGISProject("CURRENT")
-        if aprx is not None:
-            del aprx
-            return True
-    except Exception:
-        pass
     return False
 
 
 def add_to_current_map(arcpy, fc_path):
     """Best-effort add of a dataset to the active ArcMap map document.
-    Tries arcpy.mapping first, then arcpy.mp. Never raises."""
+    ArcMap-only: uses arcpy.mapping (never arcpy.mp). Never raises."""
     try:
         import arcpy.mapping as mapping
         mxd = mapping.MapDocument("CURRENT")
@@ -62,13 +57,6 @@ def add_to_current_map(arcpy, fc_path):
         mapping.AddLayer(df, lyr, "TOP")
         arcpy.RefreshActiveView()
         arcpy.RefreshTOC()
-        return True
-    except Exception:
-        pass
-    try:
-        aprx = arcpy.mp.ArcGISProject("CURRENT")
-        m = aprx.activeMap or aprx.listMaps()[0]
-        m.addDataFromPath(fc_path)
         return True
     except Exception:
         return False

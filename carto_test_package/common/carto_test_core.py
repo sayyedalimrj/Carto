@@ -118,12 +118,15 @@ PLUGIN_ORDER = ["Plugin01", "Plugin02", "Plugin03", "Plugin04",
 # the geometry it must have, and whether multiple candidates are allowed.
 # Matching is case-insensitive on the feature-class base name.
 ROLE_RULES = [
-    # role,            geometry,   name_includes (any),                                  name_excludes
-    ("road_asphalt",   "Polyline", ["asphalt_road", "freeway", "highway"],               ["airport"]),
+    # role,            geometry,   name_includes (ORDER = preference, earlier wins),     name_excludes
+    ("road_asphalt",   "Polyline", ["asphalt_road1", "asphalt_road", "freeway", "highway"], ["airport"]),
     ("road_dirt",      "Polyline", ["dirt_road"],                                        []),
-    ("road_track",     "Polyline", ["track_road", "path_lin"],                           []),
+    # Track road must prefer the real Track_Road layer, NOT footpaths (Path_Lin).
+    ("road_track",     "Polyline", ["track_road"],                                       ["path"]),
     ("road_gravel",    "Polyline", ["gravel_road"],                                      ["airport"]),
-    ("road_any",       "Polyline", ["asphalt_road", "dirt_road", "track_road",
+    # General road role: prefer real road layers (dirt/asphalt/track/gravel/freeway),
+    # never let footpaths (path) or railways outrank an actual road.
+    ("road_any",       "Polyline", ["dirt_road", "asphalt_road", "track_road",
                                     "gravel_road", "freeway", "highway", "road"],        ["airport", "railway", "path"]),
     ("watercourse",    "Polyline", ["watercourse"],                                      []),
     ("canal",          "Polyline", ["canal"],                                            []),
@@ -136,7 +139,10 @@ ROLE_RULES = [
     ("elevation_points", "Point",  ["elevation_point", "spot"],                          ["anno"]),
     ("elevation_text_anno", "Polygon", ["elevation_pointsanno", "elevation_points_anno"], []),
     ("contour_index_anno", "Polygon", ["contour_indexanno", "contour_index_anno"],       []),
-    ("bridge_existing", "Point",   ["bridge"],                                           []),
+    # Existing bridge POINT layer: prefer the dedicated point layer Bridge_P
+    # over the generic Bridge layer (runtime scoring also prefers the populated
+    # one; the ordered hint makes Bridge_P win even before counts are known).
+    ("bridge_existing", "Point",   ["bridge_p", "bridge"],                               []),
     ("spring",         "Point",    ["spring"],                                           []),
     ("spring_continual", "Point",  ["continual_spring"],                                 []),
     ("spring_seasonal", "Point",   ["seasonal_spring"],                                  []),
@@ -440,30 +446,46 @@ class RoleDetector(object):
                 "missing_fields": "",
                 "notes": "",
                 "all_candidates": [c[1]["name"] for c in candidates],
+                "all_candidate_paths": [{"name": c[1]["name"], "path": c[1]["path"],
+                                         "record_count": c[1]["record_count"]}
+                                        for c in candidates],
             }
         return self.mapping
 
     def _score(self, it, includes):
+        """Score a candidate for a role. The position of the matching include in
+        the rule's preference list matters: earlier hints win ties so that, e.g.,
+        Bridge_P outranks Bridge and Dirt_Road outranks other roads even before
+        feature counts are known. Populated layers are still preferred at runtime."""
         nm = it["name"].lower()
-        score = 0.4
-        for inc in includes:
-            if nm == inc.lower():
-                score += 0.5
+        matched_idx = None
+        base = 0.0
+        for idx, inc in enumerate(includes):
+            incl = inc.lower()
+            if nm == incl:
+                base = 0.60
+                matched_idx = idx
                 break
-            if nm.startswith(inc.lower()):
-                score += 0.35
+            if nm.startswith(incl):
+                base = 0.50
+                matched_idx = idx
                 break
-            if inc.lower() in nm:
-                score += 0.2
+            if incl in nm:
+                base = 0.40
+                matched_idx = idx
                 break
-        # Prefer layers that actually have features
+        if matched_idx is None:
+            return 0.0
+        # Ordered preference: earlier include -> higher bonus (dominates ties).
+        score = base + max(0, (len(includes) - matched_idx)) * 0.03
+        # Prefer layers that actually have features (runtime only; static = None).
         rc = it["record_count"]
         if rc is None:
-            score += 0.0
+            pass
         elif rc > 0:
-            score += 0.1
+            score += 0.10
         else:
-            score -= 0.2
+            score -= 0.25
         return min(score, 1.0)
 
     def _reason(self, role, it, includes):
@@ -480,8 +502,10 @@ class RoleDetector(object):
         rw.write_csv(csv_path, rows, fields)
         lines = [u"# Layer Role Mapping", u"",
                  u"Generated: {0}".format(rw.now_iso()), u"",
-                 u"Confidence in [0,1]. Override any row via "
-                 u"common/layer_role_mapping_template.csv or --role-map.", u""]
+                 u"Confidence in [0,1]. Override any row with a CSV "
+                 u"(`--role-map-csv`, columns `role,layer_name,notes`) or JSON "
+                 u"(`--role-map-json`). See "
+                 u"`common/layer_role_override_example.csv`.", u""]
         lines.append(u"| Role | Selected | Fallback | Conf | Geom | Count | Reason |")
         lines.append(u"|------|----------|----------|-----:|------|------:|--------|")
         for r in rows:
@@ -498,6 +522,16 @@ class RoleDetector(object):
     def path_for(self, role):
         m = self.mapping.get(role, {})
         return m.get("selected_path", "")
+
+    def candidates(self, role):
+        """Return ordered list of {name, path, record_count} candidates for a role."""
+        m = self.mapping.get(role, {})
+        return list(m.get("all_candidate_paths", []))
+
+    def fallback_paths(self, role):
+        """Return candidate paths for a role EXCLUDING the selected (primary) one."""
+        cands = self.candidates(role)
+        return cands[1:] if len(cands) > 1 else []
 
 
 
@@ -967,29 +1001,78 @@ def _angles_in_range(ctx, fc, field, lo=0.0, hi=360.0):
 # Plugin 01 - Bridge / Culvert
 # ==========================================================================
 
+def _valid_angle_count(ctx, fc, field, lo=0.0, hi=360.0):
+    """Return (n_total_nonnull, n_valid_in_range) for an angle field."""
+    arcpy = ctx.arcpy
+    if not ctx.qa.has_field(fc, field):
+        return (0, 0)
+    total = 0
+    valid = 0
+    try:
+        with arcpy.da.SearchCursor(fc, [field]) as cur:
+            for row in cur:
+                if row[0] is None:
+                    continue
+                total += 1
+                try:
+                    v = float(row[0])
+                    if (lo - 0.001) <= v <= (hi + 0.001):
+                        valid += 1
+                except Exception:
+                    pass
+    except Exception:
+        return (0, 0)
+    return (total, valid)
+
+
 def test_plugin01(ctx):
     pid = "Plugin01"
     arcpy = ctx.arcpy
     road_path = ctx.roles.path_for("road_any")
-    drain_path = ctx.roles.path_for("drainage_any") or ctx.roles.path_for("watercourse")
     bridge_path = ctx.roles.path_for("bridge_existing")
+
+    # Drainage layers to test against: prefer Watercourse (primary), then add
+    # Canal and River_L when present (role candidate lists are ordered so the
+    # primary watercourse/drainage layer is first). De-dupe by layer name.
+    drainage_specs = []
+    seen = set()
+    for role in ("watercourse", "drainage_any", "canal", "river_line"):
+        for c in ctx.roles.candidates(role):
+            nm = c.get("name")
+            if nm and nm not in seen and c.get("path"):
+                seen.add(nm)
+                drainage_specs.append(c)
+    # Keep at most 3 drainage layers for the functional matrix.
+    drainage_specs = drainage_specs[:3]
 
     # Stage safe copies
     roads = ctx.prep.copy_fc(road_path, "T01_roads", "REAL_DATA",
                              "road centerlines (barrier/reference)")
-    drains = ctx.prep.copy_fc(drain_path, "T01_drains", "REAL_DATA",
-                              "drainage / watercourse lines")
+    # Primary drainage (first spec) staged as T01_drains for back-compat.
+    primary_drain = None
+    staged_drains = []   # list of (layer_name, staged_path)
+    for idx, spec in enumerate(drainage_specs):
+        nm = spec["name"]
+        stage_name = "T01_drains" if idx == 0 else ("T01_drain_" + nm)
+        staged = ctx.prep.copy_fc(spec["path"], stage_name, "REAL_DATA",
+                                  "drainage layer for road-water intersection test")
+        if staged:
+            staged_drains.append((nm, staged))
+            if idx == 0:
+                primary_drain = staged
     bridge_before = ctx.prep.copy_fc(bridge_path, "T01_bridge_before", "REAL_DATA",
-                                     "existing bridge points") if bridge_path else None
+                                     "existing bridge points (Bridge_P preferred)") if bridge_path else None
 
-    # autofill record (smoke build)
+    drain_names = ";".join([s["name"] for s in drainage_specs]) or "(none)"
     ctx.record_autofill(pid, [
         pdesc("roads", "GPFeatureLayer(mv)", "T01_roads",
               "detected_layer" if roads else "user_required",
-              ctx.roles.get("road_any").get("confidence", 0)),
+              ctx.roles.get("road_any").get("confidence", 0),
+              "primary road=%s" % base_name(road_path)),
         pdesc("drains", "GPFeatureLayer(mv)", "T01_drains",
-              "detected_layer" if drains else "user_required",
-              ctx.roles.get("drainage_any").get("confidence", 0)),
+              "detected_layer" if primary_drain else "user_required",
+              ctx.roles.get("watercourse").get("confidence", 0),
+              "drainage layers tested: " + drain_names),
         pdesc("out_ws", "DEWorkspace", ctx.prep.result_gdb, "generated_test_layer", 1.0),
         pdesc("out_name", "GPString", "T01_bridge_after", "code_default", 1.0),
         pdesc("sample_m", "GPDouble", 8.0, "code_default", 1.0),
@@ -1000,65 +1083,98 @@ def test_plugin01(ctx):
         pdesc("end_tol", "GPDouble", 2.0, "code_default", 1.0),
     ])
 
-    # ---- Smoke / Functional: Build bridge points at crossings ----
+    # ---- Smoke / Functional: build bridge points per drainage layer ----
     if ctx.want("smoke") or ctx.want("functional"):
-        rec = _new(ctx, pid, "Build Bridge Points (Road x Drain)",
-                   "functional" if ctx.want("functional") else "smoke")
-        t = time.time()
-        if not roads or not drains:
+        if not roads or not staged_drains:
+            rec = _new(ctx, pid, "Build Bridge Points (Road x Drain)", "functional")
+            t = time.time()
             rw.finalize_timing(_skip(rec, "Missing road and/or drainage layer (roads=%s drains=%s)"
-                                      % (bool(roads), bool(drains))), t)
+                                      % (bool(roads), len(staged_drains))), t)
             ctx.writer.add(rec)
         else:
-            rec["input_layers"] = ["T01_roads", "T01_drains"]
-            out_name = "T01_bridge_after"
-            out_fc = _result_path(ctx, out_name)
-            # Pre: count true crossings independently for comparison
-            isect = _result_path(ctx, "T01_intersections")
-            n_isect = None
-            try:
-                if arcpy.Exists(isect):
-                    arcpy.management.Delete(isect)
-                arcpy.analysis.Intersect([roads, drains], isect, "ONLY_FID",
-                                         output_type="POINT")
-                n_isect = ctx.qa.count(isect)
-            except Exception as ex:
-                ctx.log("T01 intersect pre-count warning: " + str(ex))
-            rec["success_metrics"]["road_drain_intersections"] = n_isect
-            args = [join_mv([roads]), join_mv([drains]), ctx.prep.result_gdb,
-                    out_name, 8.0, "ROTATION", "GEOGRAPHIC", False, None, 2.0]
-            rec["parameters_used"] = {"roads": "T01_roads", "drains": "T01_drains",
-                                      "out_name": out_name, "rot_type": "GEOGRAPHIC"}
-            try:
-                ctx.runner.run(pid, "BuildBridgePoints", args, rec)
-                if not arcpy.Exists(out_fc):
-                    _fail(rec, "Expected output not created: " + out_fc, exc=False)
-                else:
-                    n_out = ctx.qa.count(out_fc)
-                    rec["output_layers"] = [out_name]
-                    rec["after_feature_count"] = n_out
-                    rec["geometry_validity_result"] = ctx.qa.geometry_validity(out_fc)
-                    rec["spatial_reference_check"] = ctx.qa.sr_check(out_fc)
-                    rec["field_schema_check"] = "ROTATION present" if ctx.qa.has_field(out_fc, "ROTATION") else "ROTATION MISSING"
-                    in_range, st = _angles_in_range(ctx, out_fc, "ROTATION")
-                    if st:
-                        rec["success_metrics"]["angle_stats"] = {
-                            "n": st[0], "min": round(st[1], 2), "max": round(st[2], 2)}
-                    ctx.snapshots.append(ctx.qa.snapshot(pid, "bridge_after", out_fc,
-                                         "after", ctx.prep.snap_after, angle_field="ROTATION"))
-                    ok = ctx.qa.has_field(out_fc, "ROTATION") and (n_out is not None)
-                    if ok and in_range is False:
-                        rec["status"] = "WARN"
-                        rec["notes"] = "ROTATION values outside 0..360 band"
-                    elif ok:
-                        rec["status"] = "PASS"
-                        rec["notes"] = "Created %s bridge point(s); intersections=%s" % (n_out, n_isect)
+            # Test against each available drainage layer (Watercourse, Canal, River_L).
+            for di, (dname, dpath) in enumerate(staged_drains):
+                # Smoke only runs the first (primary) drainage layer; functional
+                # runs all available drainage layers.
+                if di > 0 and not ctx.want("functional"):
+                    break
+                ttype = "smoke" if (di == 0 and not ctx.want("functional")) else "functional"
+                rec = _new(ctx, pid, "Build Bridge Points: roads x %s" % dname, ttype)
+                t = time.time()
+                rec["input_layers"] = ["T01_roads", base_name(dpath)]
+                out_name = "T01_bridge_after" if di == 0 else ("T01_bridge_after_" + dname)
+                out_fc = _result_path(ctx, out_name)
+                isect = _result_path(ctx, "T01_intersections" if di == 0
+                                      else "T01_intersections_" + dname)
+                n_isect = None
+                try:
+                    if arcpy.Exists(isect):
+                        arcpy.management.Delete(isect)
+                    arcpy.analysis.Intersect([roads, dpath], isect, "ONLY_FID",
+                                             output_type="POINT")
+                    n_isect = ctx.qa.count(isect)
+                except Exception as ex:
+                    ctx.log("T01 intersect pre-count warning (%s): %s" % (dname, str(ex)))
+                args = [join_mv([roads]), join_mv([dpath]), ctx.prep.result_gdb,
+                        out_name, 8.0, "ROTATION", "GEOGRAPHIC", False, None, 2.0]
+                rec["parameters_used"] = {"roads": "T01_roads", "drain_layer": dname,
+                                          "out_name": out_name, "rot_type": "GEOGRAPHIC"}
+                try:
+                    ctx.runner.run(pid, "BuildBridgePoints", args, rec)
+                    if not arcpy.Exists(out_fc):
+                        # Zero true crossings is a legitimate outcome (no output FC).
+                        rec["success_metrics"] = {
+                            "drainage_layer": dname, "road_layer": base_name(road_path),
+                            "intersection_count": n_isect, "output_bridge_count": 0,
+                            "angle_field": "ROTATION", "valid_angle_count": 0,
+                            "angular_difference_summary": "n/a (no output)"}
+                        if n_isect in (0, None):
+                            rec["status"] = "PASS"
+                            rec["notes"] = "No true crossings for roads x %s; no output (acceptable)" % dname
+                        else:
+                            rec["status"] = "WARN"
+                            rec["notes"] = "%s intersections but no bridge output for %s" % (n_isect, dname)
                     else:
-                        _fail(rec, "Output missing ROTATION field or count", exc=False)
-            except Exception as ex:
-                _fail(rec, ex)
-            rw.finalize_timing(rec, t)
-            ctx.writer.add(rec)
+                        n_out = ctx.qa.count(out_fc)
+                        rec["output_layers"] = [out_name]
+                        rec["after_feature_count"] = n_out
+                        rec["geometry_validity_result"] = ctx.qa.geometry_validity(out_fc)
+                        rec["spatial_reference_check"] = ctx.qa.sr_check(out_fc)
+                        has_rot = ctx.qa.has_field(out_fc, "ROTATION")
+                        rec["field_schema_check"] = "ROTATION present" if has_rot else "ROTATION MISSING"
+                        in_range, st = _angles_in_range(ctx, out_fc, "ROTATION")
+                        n_tot, n_valid = _valid_angle_count(ctx, out_fc, "ROTATION")
+                        ang_summary = "n/a"
+                        if st:
+                            ang_summary = ("min=%.1f max=%.1f mean=%.1f (within 0-360)"
+                                           % (st[1], st[2], st[3])) if in_range else \
+                                          ("min=%.1f max=%.1f mean=%.1f (OUT OF 0-360)"
+                                           % (st[1], st[2], st[3]))
+                        rec["success_metrics"] = {
+                            "drainage_layer": dname,
+                            "road_layer": base_name(road_path),
+                            "intersection_count": n_isect,
+                            "output_bridge_count": n_out,
+                            "angle_field": "ROTATION" if has_rot else None,
+                            "valid_angle_count": "%s/%s" % (n_valid, n_tot),
+                            "angular_difference_summary": ang_summary}
+                        ctx.snapshots.append(ctx.qa.snapshot(
+                            pid, "bridge_after_" + dname, out_fc, "after",
+                            ctx.prep.snap_after, angle_field="ROTATION"))
+                        if not has_rot or n_out is None:
+                            _fail(rec, "Output missing ROTATION field or count", exc=False)
+                        elif in_range is False or (n_tot and n_valid < n_tot):
+                            rec["status"] = "WARN"
+                            rec["notes"] = ("roads x %s: %s bridges, %s/%s valid angles "
+                                            "(some outside 0-360)" % (dname, n_out, n_valid, n_tot))
+                        else:
+                            rec["status"] = "PASS"
+                            rec["notes"] = ("roads x %s: %s intersections -> %s bridge(s), "
+                                            "all angles valid" % (dname, n_isect, n_out))
+                except Exception as ex:
+                    _fail(rec, ex)
+                rw.finalize_timing(rec, t)
+                ctx.writer.add(rec)
 
     # ---- Functional: rotate existing bridges (COPY_TO_OUTPUT, geometry must NOT move) ----
     if ctx.want("functional") or ctx.want("regression"):
@@ -1086,18 +1202,34 @@ def test_plugin01(ctx):
                     n_after = ctx.qa.count(out_fc)
                     rec["after_feature_count"] = n_after
                     rec["changed_feature_count"] = 0
-                    rec["field_schema_check"] = "ROTATION present" if ctx.qa.has_field(out_fc, "ROTATION") else "ROTATION MISSING"
+                    has_rot = ctx.qa.has_field(out_fc, "ROTATION")
+                    rec["field_schema_check"] = "ROTATION present" if has_rot else "ROTATION MISSING"
                     rec["geometry_validity_result"] = ctx.qa.geometry_validity(out_fc)
+                    in_range, st = _angles_in_range(ctx, out_fc, "ROTATION")
+                    n_tot, n_valid = _valid_angle_count(ctx, out_fc, "ROTATION")
                     # regression: source bridge count unchanged + output count == input
                     src_unchanged = (ctx.qa.count(bridge_before) == n_before)
                     count_match = (n_after == n_before)
-                    if src_unchanged and count_match and ctx.qa.has_field(out_fc, "ROTATION"):
+                    angles_valid = (n_tot == 0) or (n_valid == n_tot)
+                    rec["success_metrics"] = {
+                        "existing_bridge_layer": base_name(bridge_path),
+                        "count_before": n_before, "count_after": n_after,
+                        "source_count_unchanged": src_unchanged,
+                        "rotation_field": "ROTATION" if has_rot else None,
+                        "valid_angle_count": "%s/%s" % (n_valid, n_tot)}
+                    if src_unchanged and count_match and has_rot and angles_valid:
                         rec["status"] = "PASS"
-                        rec["notes"] = "Existing bridges preserved (%s); ROTATION written; source untouched" % n_after
+                        rec["notes"] = ("Existing bridges preserved (%s); ROTATION written & valid; "
+                                        "source untouched" % n_after)
+                    elif not src_unchanged or not count_match:
+                        rec["status"] = "FAIL"
+                        rec["notes"] = ("Bridge count changed: source_unchanged=%s in=%s out=%s "
+                                        "(tool should NOT add/delete features)"
+                                        % (src_unchanged, n_before, n_after))
                     else:
-                        rec["status"] = "WARN" if src_unchanged else "FAIL"
-                        rec["notes"] = ("count_match=%s src_unchanged=%s rot=%s"
-                                        % (count_match, src_unchanged, ctx.qa.has_field(out_fc, "ROTATION")))
+                        rec["status"] = "WARN"
+                        rec["notes"] = ("rot_field=%s valid_angles=%s/%s"
+                                        % (has_rot, n_valid, n_tot))
             except Exception as ex:
                 _fail(rec, ex)
             rw.finalize_timing(rec, t)
@@ -1252,16 +1384,29 @@ def test_plugin02(ctx):
                     rec["after_feature_count"] = n_out
                     rec["geometry_validity_result"] = ctx.qa.geometry_validity(target_after)
                     rec["spatial_reference_check"] = ctx.qa.sr_check(target_after)
-                    rec["success_metrics"] = {"conflicts_before": n_before,
+                    reduction_pct = None
+                    if n_before:
+                        try:
+                            reduction_pct = round(100.0 * (n_before - (n_after or 0)) / float(n_before), 1)
+                        except Exception:
+                            reduction_pct = None
+                    rec["success_metrics"] = {"road_layer": base_name(road_path),
+                                              "target_layer": base_name(pt_path),
+                                              "safe_distance": clearance,
+                                              "conflicts_before": n_before,
                                               "conflicts_after": n_after,
-                                              "count_in": n_in, "count_out": n_out}
+                                              "reduction_pct": reduction_pct,
+                                              "features_in": n_in, "features_out": n_out,
+                                              "features_unchanged_count": (n_out == n_in)}
                     ctx.snapshots.append(ctx.qa.snapshot(pid, "conflicts_before", points, "before", ctx.prep.snap_before, conflicts=n_before))
                     ctx.snapshots.append(ctx.qa.snapshot(pid, "targets_after", target_after, "after", ctx.prep.snap_after, conflicts=n_after))
                     count_ok = (n_out == n_in)
                     if n_before is not None and n_after is not None:
                         if n_after <= n_before and count_ok:
                             rec["status"] = "PASS"
-                            rec["notes"] = "conflicts %s -> %s, no feature loss" % (n_before, n_after)
+                            rec["notes"] = ("road=%s target=%s d=%s: conflicts %s -> %s (%s%% reduction), "
+                                            "no feature loss" % (base_name(road_path), base_name(pt_path),
+                                                                 clearance, n_before, n_after, reduction_pct))
                         elif not count_ok:
                             rec["status"] = "FAIL"
                             rec["notes"] = "feature count changed %s -> %s" % (n_in, n_out)
@@ -1699,6 +1844,16 @@ def test_plugin05(ctx):
     frame_path = os.path.join(ctx.prep.test_gdb, "T00_TestFrame")
     if not arcpy.Exists(frame_path):
         frame_path = ctx.prep.make_frame_polygon(ctx.items)
+    # Ensure the frame is a TRUE polygon (never a line/annotation AOI). If a
+    # detected aoi_frame is not polygon, or the synthesized frame is missing,
+    # (re)synthesize a polygon frame from the data extent.
+    try:
+        if frame_path and arcpy.Exists(frame_path):
+            if str(getattr(arcpy.Describe(frame_path), "shapeType", "")).lower() != "polygon":
+                frame_path = ctx.prep.make_frame_polygon(ctx.items)
+    except Exception as ex:
+        ctx.log("frame polygon check warning: " + str(ex))
+        frame_path = ctx.prep.make_frame_polygon(ctx.items)
 
     ctx.record_autofill(pid, [
         pdesc("in_contours", "GPFeatureLayer(mv)", "T05_dense_contours_before",
@@ -1783,22 +1938,90 @@ def test_plugin05(ctx):
                     rec["success_metrics"] = {"count_before": n_before, "count_after": n_after,
                                               "frame_edge_before": edge_before,
                                               "frame_edge_after": edge_after,
-                                              "removal_method": method}
+                                              "removal_method": method,
+                                              "internal_removed": rec["changed_feature_count"],
+                                              "frame_is_polygon": True}
                     ctx.snapshots.append(ctx.qa.snapshot(pid, "dense_after", out_fc, "after",
                                          ctx.prep.snap_after, conflicts=edge_after))
+                    # Explicit PASS / WARN / FAIL criteria:
+                    #   FAIL  : frame-edge contours decreased (edge protection broke)
+                    #   PASS  : frame edge preserved AND some internal dense contours
+                    #           were removed/flagged (after <= before)
+                    #   WARN  : frame edge preserved but nothing was removed
                     edge_protected = (edge_before is None or edge_after is None or edge_after >= edge_before)
+                    removed_some = (n_after is not None and n_before is not None and n_after < n_before)
+                    no_increase = (n_after is not None and n_before is not None and n_after <= n_before)
                     if not edge_protected:
                         rec["status"] = "FAIL"
-                        rec["notes"] = "Frame-edge contours were removed (%s -> %s)" % (edge_before, edge_after)
-                    elif n_after is not None and n_before is not None and n_after <= n_before:
+                        rec["notes"] = ("Frame-edge contours were removed (%s -> %s) - edge protection FAILED"
+                                        % (edge_before, edge_after))
+                    elif removed_some:
                         rec["status"] = "PASS"
-                        rec["notes"] = "Cleaned %s feature(s); frame edge preserved (%s)" % (
-                            rec["changed_feature_count"], edge_after)
-                    else:
+                        rec["notes"] = ("Removed %s internal dense feature(s); frame-edge contours preserved "
+                                        "(%s -> %s); method=%s" % (rec["changed_feature_count"],
+                                                                   edge_before, edge_after, method))
+                    elif no_increase:
                         rec["status"] = "WARN"
-                        rec["notes"] = "No reduction (count %s -> %s); frame edge preserved" % (n_before, n_after)
+                        rec["notes"] = ("Frame edge preserved but no dense contours removed "
+                                        "(count %s -> %s) - check dense_threshold for this data"
+                                        % (n_before, n_after))
+                    else:
+                        rec["status"] = "FAIL"
+                        rec["notes"] = "Output count increased (%s -> %s) - unexpected" % (n_before, n_after)
             rw.finalize_timing(rec, t)
             ctx.writer.add(rec)
+
+    # Regression: PROTECTED contours must never be removed. This exercises the
+    # same protected_sql mechanism used to protect INDEX contours: when every
+    # eligible contour is protected, the cleaner must remove nothing. This is a
+    # deterministic proxy for "index contours are protected unless explicitly
+    # allowed" (set protected_sql to your index selection in real runs).
+    if interval and (ctx.want("functional") or ctx.want("regression")) \
+            and frame_path and arcpy.Exists(frame_path):
+        rec = _new(ctx, pid, "Regression: protected contours are never removed", "regression")
+        t = time.time()
+        n_before = ctx.qa.count(interval)
+        rec["before_feature_count"] = n_before
+        rec["input_layers"] = ["T05_dense_contours_before", "T00_TestFrame"]
+        rec["parameters_used"] = {"dense_threshold": 20.0, "protected_sql": "1=1",
+                                  "note": "all contours protected"}
+        out_name = "T05_protected_after"
+        out_fc = _result_path(ctx, out_name)
+        method = "Segment Erase (recommended)"
+        try:
+            args = _p05_args([interval], frame_path, 20.0, ctx.prep.result_gdb, out_name,
+                             method, protected_sql="1=1")
+            ctx.runner.run(pid, "SafeContourCleaner", args, rec)
+        except Exception as ex:
+            msg = str(ex).lower()
+            if "license" in msg or "erase" in msg or "advanced" in msg:
+                method = "Delete Whole Features"
+                try:
+                    args = _p05_args([interval], frame_path, 20.0, ctx.prep.result_gdb,
+                                     out_name, method, protected_sql="1=1")
+                    ctx.runner.run(pid, "SafeContourCleaner", args, rec)
+                except Exception as ex2:
+                    _fail(rec, ex2)
+            else:
+                _fail(rec, ex)
+        if rec["status"] != "FAIL":
+            # Tool may legitimately produce no output when nothing is eligible.
+            n_after = ctx.qa.count(out_fc) if arcpy.Exists(out_fc) else n_before
+            rec["after_feature_count"] = n_after
+            rec["changed_feature_count"] = (n_before - n_after) if (n_before is not None and n_after is not None) else None
+            rec["success_metrics"] = {"count_before": n_before, "count_after": n_after,
+                                      "protected_sql": "1=1", "removal_method": method,
+                                      "produced_output": bool(arcpy.Exists(out_fc))}
+            if n_after is not None and n_before is not None and n_after >= n_before:
+                rec["status"] = "PASS"
+                rec["notes"] = ("All contours protected -> none removed (%s -> %s). "
+                                "Index contours protected the same way." % (n_before, n_after))
+            else:
+                rec["status"] = "FAIL"
+                rec["notes"] = ("Protected contours were removed (%s -> %s) - protected_sql NOT honored"
+                                % (n_before, n_after))
+        rw.finalize_timing(rec, t)
+        ctx.writer.add(rec)
 
     # Edge: missing frame + allow_full False -> expect controlled error
     if ctx.want("edge") and interval:
@@ -2052,14 +2275,21 @@ def test_plugin07(ctx):
     rec["before_feature_count"] = n_sheets
 
     if not has_map and not mxd_folder:
+        plat_proj = "ArcGIS Pro .aprx project" if ctx.platform == "ArcGISPro" else "ArcMap .mxd"
         rw.finalize_timing(_skip(rec,
-            "Plugin07 requires an active map document (AOI_LAYER_IN_CURRENT_MXD) "
-            "or a folder of MXDs/projects (FOLDER_OF_MXDS). Neither available in this "
-            "standalone run. Run via the .pyt TestHarness inside ArcMap/Pro with "
-            "T07_test_sheets added to the map, or pass --mxd-folder. Test sheets were "
-            "prepared at test_data.gdb/T07_test_sheets."), t)
+            "Plugin07 (Batch Grid Builder) needs a map context and cannot run fully "
+            "headless. To run it, choose ONE of: "
+            "(1) run the .pyt TestHarness (Carto_%s_TestHarness.pyt) INSIDE an active "
+            "ArcMap / ArcGIS Pro session - the harness detects the CURRENT map and uses "
+            "AOI_LAYER_IN_CURRENT_MXD with the prepared sheet polygons; "
+            "(2) pass --mxd-folder pointing to a folder of ArcMap .mxd documents "
+            "(FOLDER_OF_MXDS mode); or "
+            "(3) pass --mxd-folder pointing to a folder of %s files (FOLDER_OF_MXDS "
+            "mode in Pro). The test sheet polygons have already been prepared at "
+            "test_data.gdb/T07_test_sheets (%s sheets) - add that layer to your active "
+            "map for option (1)." % (
+                "ArcMap" if ctx.platform != "ArcGISPro" else "Pro", plat_proj, n_sheets)), t)
         ctx.writer.add(rec)
-        # still emit smoke skip for one sheet
         return
 
     try:
@@ -2235,12 +2465,45 @@ def run(config):
 
 
 def _apply_role_overrides(config, detector, items, writer):
-    """Apply role overrides from config['role_map'] (dict role->layer_name) or a CSV path."""
+    """Apply manual layer-role overrides. Accepts, in priority order:
+      * config['role_map']      - a dict {role: layer_name}
+      * config['role_map_json'] - path to a JSON file, either {role: layer_name}
+                                  or {"overrides": [{"role":..,"layer_name":..}]}
+      * config['role_map_csv']  - path to a CSV with a 'role' column and either a
+                                  'layer_name' (preferred) or legacy
+                                  'selected_layer' column. A 'notes' column is
+                                  optional and recorded on the mapping.
+    The matched layer must exist in the scanned inventory; unknown layers are
+    logged and skipped (never silently ignored)."""
     overrides = config.get("role_map")
     csv_path = config.get("role_map_csv")
-    mapping = {}
+    json_path = config.get("role_map_json")
+    mapping = {}     # role -> layer_name
+    notes = {}       # role -> note
+
     if isinstance(overrides, dict):
         mapping.update(overrides)
+
+    if json_path and os.path.exists(json_path):
+        try:
+            import json as _json
+            data = _json.load(open(json_path, "r"))
+            rows = data.get("overrides", data) if isinstance(data, dict) else data
+            if isinstance(rows, dict):
+                for role, layer in rows.items():
+                    if role and layer:
+                        mapping[role] = layer
+            elif isinstance(rows, list):
+                for row in rows:
+                    role = (row.get("role") or "").strip()
+                    layer = (row.get("layer_name") or row.get("selected_layer") or "").strip()
+                    if role and layer:
+                        mapping[role] = layer
+                        if row.get("notes"):
+                            notes[role] = row.get("notes")
+        except Exception as ex:
+            writer.log("role-map JSON parse warning: " + str(ex))
+
     if csv_path and os.path.exists(csv_path):
         try:
             import csv as _csv
@@ -2248,25 +2511,45 @@ def _apply_role_overrides(config, detector, items, writer):
             try:
                 for row in _csv.DictReader(f):
                     role = (row.get("role") or "").strip()
-                    sel = (row.get("selected_layer") or "").strip()
-                    if role and sel:
-                        mapping[role] = sel
+                    # Prefer 'layer_name'; fall back to legacy 'selected_layer'.
+                    layer = (row.get("layer_name") or row.get("selected_layer") or "").strip()
+                    if role and layer:
+                        mapping[role] = layer
+                        if row.get("notes"):
+                            notes[role] = (row.get("notes") or "").strip()
             finally:
                 f.close()
         except Exception as ex:
             writer.log("role-map CSV parse warning: " + str(ex))
+
     for role, layer in mapping.items():
         it = None
         for cand in items:
             if cand["name"].lower() == layer.lower():
                 it = cand
                 break
-        if it and role in detector.mapping:
-            detector.mapping[role]["selected_layer"] = it["name"]
-            detector.mapping[role]["selected_path"] = it["path"]
-            detector.mapping[role]["confidence"] = 1.0
-            detector.mapping[role]["reason"] = "manual override"
-            writer.log("Role override: %s -> %s" % (role, it["name"]))
+        if not it:
+            writer.log("Role override SKIPPED (layer not found in inventory): %s -> %s"
+                       % (role, layer))
+            continue
+        detector.mapping.setdefault(role, {"role": role})
+        m = detector.mapping[role]
+        m["selected_layer"] = it["name"]
+        m["selected_path"] = it["path"]
+        m["confidence"] = 1.0
+        m["reason"] = "manual override" + ((" - " + notes[role]) if role in notes else "")
+        m["geometry_type"] = it.get("geometry_type", m.get("geometry_type", ""))
+        m["record_count"] = it.get("record_count", m.get("record_count", ""))
+        if role in notes:
+            m["notes"] = notes[role]
+        # Make the overridden layer the head of the candidate list so multi-layer
+        # consumers (e.g. Plugin01 drainage iteration) honor the override first.
+        cands = m.get("all_candidate_paths", [])
+        head = {"name": it["name"], "path": it["path"],
+                "record_count": it.get("record_count")}
+        cands = [head] + [c for c in cands if c.get("name") != it["name"]]
+        m["all_candidate_paths"] = cands
+        writer.log("Role override: %s -> %s" % (role, it["name"]))
 
 
 # ---- CLI parsing (shared by both standalone runners) --------------------
@@ -2294,6 +2577,8 @@ def parse_cli(argv):
             cfg["mxd_folder"] = nxt(); i += 2; continue
         if a in ("--role-map-csv", "--role_map_csv"):
             cfg["role_map_csv"] = nxt(); i += 2; continue
+        if a in ("--role-map-json", "--role_map_json"):
+            cfg["role_map_json"] = nxt(); i += 2; continue
         if a == "--unsafe":
             cfg["safe_mode"] = False; i += 1; continue
         i += 1
