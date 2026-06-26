@@ -510,265 +510,323 @@ def _run_near_table(spr_fc_proj, con_fc_proj, out_tbl, k, near_method, search_ra
 
 
 # --------------------------
-# Methods (01..05)
+# Methods (re-ranked + renamed)
 # --------------------------
+#
+# Rank 1 (FINAL_PRIMARY)    : 01_Downhill_CentroidHL              (was 05_CentroidHL)
+# Rank 2 (FINAL_SECONDARY)  : 02_Downhill_WeightedPlaneFitAspect  (NEW - replaces broken 04_PlaneFit)
+# Rank 3 (FALLBACK)         : 03_Downhill_HighLow                 (was 02_HighLow)
+# Diagnostic only           : 04_Diagnostic_NearTangent           (was 01_NearTangent)
+# Diagnostic only           : 05_Diagnostic_NearNormal            (was 03_NearNormal)
+#
+# Every method returns a dict: {sid: {"rot","ok","note","conf","zr","sc"}}.
 
-def _method_01_neartangent(spr_fc_proj, con_geom, sr_work, tangent_step, offset):
-    out = {}
-    with arcpy.da.SearchCursor(spr_fc_proj, ["SPR_TMPID", "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
-        for sid, nf, nx, ny in cur:
-            sid = int(sid)
-            if nf is None or nx is None or ny is None or int(nf) < 0:
-                out[sid] = (None, 0, "NO_NEAR")
-                continue
-            line = con_geom.get(int(nf))
-            if line is None:
-                out[sid] = (None, 0, "NO_LINE")
-                continue
-            pt = arcpy.PointGeometry(arcpy.Point(nx, ny), sr_work)
-            az = _tangent_az_at_near(line, pt, tangent_step)
-            if az is None:
-                out[sid] = (None, 0, "TAN_FAIL")
-            else:
-                out[sid] = (_wrap360(az + offset), 1, "OK")
-    return out
+CODE_CENTROIDHL = "01_Downhill_CentroidHL"
+CODE_WPA        = "02_Downhill_WeightedPlaneFitAspect"
+CODE_HIGHLOW    = "03_Downhill_HighLow"
+CODE_NEARTAN    = "04_Diagnostic_NearTangent"
+CODE_NEARNORM   = "05_Diagnostic_NearNormal"
 
-def _method_03_nearnormal(spr_fc_proj, offset):
-    out = {}
-    with arcpy.da.SearchCursor(spr_fc_proj, ["SPR_TMPID", "SHAPE@XY", "NEAR_X", "NEAR_Y"]) as cur:
-        for sid, (sx, sy), nx, ny in cur:
-            sid = int(sid)
-            if nx is None or ny is None:
-                out[sid] = (None, 0, "NO_NEAR")
-                continue
-            az = _azimuth_geo_deg(nx - sx, ny - sy)
-            if az is None:
-                out[sid] = (None, 0, "ZERO")
-            else:
-                out[sid] = (_wrap360(az + offset), 1, "OK")
-    return out
+# Ordered (code, rank, recommended-use, notes) metadata for every method.
+METHOD_META = [
+    (CODE_CENTROIDHL, 1, "FINAL_PRIMARY",
+     "Robust centroid(high)->centroid(low); least sensitive to a single outlier contour."),
+    (CODE_WPA, 2, "FINAL_SECONDARY",
+     "Inverse-distance weighted, centered least-squares plane fit; downhill = -gradient (aspect)."),
+    (CODE_HIGHLOW, 3, "FALLBACK",
+     "Highest->lowest contour vector; correct downhill but more sensitive to outlier/tie cases."),
+    (CODE_NEARTAN, 4, "DIAGNOSTIC_ONLY",
+     "Contour tangent at nearest point; follows the contour, NOT a downhill direction."),
+    (CODE_NEARNORM, 5, "DIAGNOSTIC_ONLY",
+     "Spring->nearest contour point; geometry only, not a reliable downhill direction."),
+]
+METHOD_RANK  = dict((c, r) for (c, r, u, n) in METHOD_META)
+METHOD_USE   = dict((c, u) for (c, r, u, n) in METHOD_META)
+METHOD_NOTE  = dict((c, n) for (c, r, u, n) in METHOD_META)
+METHOD_ORDER = [c for (c, r, u, n) in METHOD_META]
+
+K_MIN_SAMPLES = 4   # minimum "good" sample count for full WPA confidence
+
+
+def _res(rot, ok, note, conf=None, zr=None, sc=None):
+    """Standard per-spring result record used by every method."""
+    return {"rot": rot, "ok": int(ok), "note": note,
+            "conf": conf, "zr": zr, "sc": sc}
+
+
+def _ang_diff(a, b):
+    """Smallest absolute angular difference in degrees (0..180)."""
+    if a is None or b is None:
+        return None
+    d = abs(float(a) - float(b)) % 360.0
+    if d > 180.0:
+        d = 360.0 - d
+    return d
+
+
+def _clamp01(v):
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _solve_centered_plane(pts, weights=None):
+    """
+    Stable, CENTERED least-squares plane fit  z = a*x0 + b*y0 + c
+    where x0 = x - mean_x, y0 = y - mean_y (z is centered too).
+
+    Centering removes the huge UTM coordinate offsets that make the raw
+    normal equations falsely singular / ill-conditioned (the root cause
+    of the old 04_PlaneFit "PLANEFIT_SINGULAR -> 0/1631 OK" failure).
+    Uses the closed-form 2x2 centered-covariance solution -- pure Python,
+    no NumPy, so it is identical in ArcMap (Py2.7) and Pro (Py3):
+
+        sxx = Sum w*x0^2    syy = Sum w*y0^2    sxy = Sum w*x0*y0
+        sxz = Sum w*x0*z0   syz = Sum w*y0*z0
+        det = sxx*syy - sxy*sxy
+        a   = (sxz*syy - syz*sxy) / det
+        b   = (syz*sxx - sxz*sxy) / det
+
+    Returns (a, b, note). note is None on success, else a failure code:
+        NEED_3PTS, PLANEFIT_COLLINEAR.
+    """
+    n = len(pts)
+    if n < 3:
+        return (None, None, "NEED_3PTS")
+    if weights is None:
+        weights = [1.0] * n
+    W = 0.0
+    mx = my = mz = 0.0
+    for w, (x, y, z) in zip(weights, pts):
+        W += w
+        mx += w * x
+        my += w * y
+        mz += w * z
+    if W <= 0.0:
+        return (None, None, "NEED_3PTS")
+    mx /= W
+    my /= W
+    mz /= W
+    sxx = syy = sxy = sxz = syz = 0.0
+    for w, (x, y, z) in zip(weights, pts):
+        x0 = x - mx
+        y0 = y - my
+        z0 = z - mz
+        sxx += w * x0 * x0
+        syy += w * y0 * y0
+        sxy += w * x0 * y0
+        sxz += w * x0 * z0
+        syz += w * y0 * z0
+    det = sxx * syy - sxy * sxy
+    scale = max(sxx, syy, 1e-30)
+    # Relative collinearity / singularity test on CENTERED moments only.
+    # (No raw normal-equation determinant test on uncentered UTM coords.)
+    if det <= 1e-12 * scale * scale:
+        return (None, None, "PLANEFIT_COLLINEAR")
+    a = (sxz * syy - syz * sxy) / det
+    b = (syz * sxx - sxz * sxy) / det
+    return (a, b, None)
+
+
+def _centroid_hl_az(pts):
+    """Internal centroid(high)->centroid(low) azimuth (for agreement checks)."""
+    if len(pts) < 2:
+        return None
+    zs = sorted([p[2] for p in pts])
+    med = zs[len(zs) // 2]
+    high = [p for p in pts if p[2] >= med]
+    low = [p for p in pts if p[2] <= med]
+    if not high or not low:
+        return None
+    hx = sum(p[0] for p in high) / float(len(high))
+    hy = sum(p[1] for p in high) / float(len(high))
+    lx = sum(p[0] for p in low) / float(len(low))
+    ly = sum(p[1] for p in low) / float(len(low))
+    return _azimuth_geo_deg(lx - hx, ly - hy)
+
 
 def _near_table_id_field(near_tbl):
     names = [f.name for f in arcpy.ListFields(near_tbl)]
     return "SPR_TMPID" if "SPR_TMPID" in names else "IN_FID"
 
-def _method_02_highlow(near_tbl, elev_lu, spr_fc_proj, offset):
-    fallback = _method_03_nearnormal(spr_fc_proj, offset)
+
+def _collect_samples(near_tbl, elev_lu, with_dist=False):
+    """sid -> [(x, y, z[, dist]) ...] from the GenerateNearTable output."""
     id_field = _near_table_id_field(near_tbl)
-    recs = {}
-    with arcpy.da.SearchCursor(near_tbl, [id_field, "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
-        for sid, nf, nx, ny in cur:
+    fields = [id_field, "NEAR_FID", "NEAR_X", "NEAR_Y"]
+    if with_dist:
+        fields.append("NEAR_DIST")
+    samples = {}
+    with arcpy.da.SearchCursor(near_tbl, fields) as cur:
+        for row in cur:
+            sid, nf, nx, ny = row[0], row[1], row[2], row[3]
             if sid is None or nf is None or nx is None or ny is None:
                 continue
-            sid = int(sid)
             z = elev_lu.get(int(nf))
             if z is None:
                 continue
-            recs.setdefault(sid, []).append((float(z), float(nx), float(ny)))
+            sid = int(sid)
+            if with_dist:
+                nd = row[4]
+                d = float(nd) if nd is not None else 0.0
+                samples.setdefault(sid, []).append(
+                    (float(nx), float(ny), float(z), d))
+            else:
+                samples.setdefault(sid, []).append(
+                    (float(nx), float(ny), float(z)))
+    return samples
+
+
+# ----- Diagnostic: NearTangent (code 04) -------------------------------------
+
+def _method_neartangent(spr_fc_proj, con_geom, sr_work, tangent_step, offset):
     out = {}
-    for sid, fb in fallback.items():
-        rows = recs.get(sid, [])
-        if len(rows) < 2:
-            out[sid] = (fb[0], 0, "FALLBACK_NEAR_NRM")
-            continue
-        rows_sorted = sorted(rows, key=lambda t: t[0])
-        low = rows_sorted[0]
-        high = rows_sorted[-1]
-        if high[0] == low[0]:
-            out[sid] = (fb[0], 0, "FLAT_FALLBACK")
-            continue
-        az = _azimuth_geo_deg(low[1] - high[1], low[2] - high[2])
-        if az is None:
-            out[sid] = (fb[0], 0, "DEGEN_FALLBACK")
-        else:
-            out[sid] = (_wrap360(az + offset), 1, "OK")
+    with arcpy.da.SearchCursor(spr_fc_proj, ["SPR_TMPID", "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
+        for sid, nf, nx, ny in cur:
+            sid = int(sid)
+            if nf is None or nx is None or ny is None or int(nf) < 0:
+                out[sid] = _res(None, 0, "NO_NEAR")
+                continue
+            line = con_geom.get(int(nf))
+            if line is None:
+                out[sid] = _res(None, 0, "NO_LINE")
+                continue
+            pt = arcpy.PointGeometry(arcpy.Point(nx, ny), sr_work)
+            az = _tangent_az_at_near(line, pt, tangent_step)
+            if az is None:
+                out[sid] = _res(None, 0, "TAN_FAIL")
+            else:
+                out[sid] = _res(_wrap360(az + offset), 1, "OK")
     return out
 
-def _method_04_planefit(near_tbl, elev_lu, offset):
-    """
-    Least-squares plane fit z = a*x + b*y + c over K nearby contour points
-    around each spring.
 
-    MASTER RULE: PlaneFit singularity fix.
-    --------------------------------------
-    The original implementation only checked |det(M)| < 1e-9. That misses
-    the "almost singular" case where the points are nearly collinear --
-    det(M) is small but non-zero, so Cramer's rule produces a numerically
-    bogus plane. We now also:
+# ----- Diagnostic: NearNormal (code 05) --------------------------------------
 
-      1. Build the symmetric 3x3 normal matrix
-             M = [[Sxx, Sxy, Sx],
-                  [Sxy, Syy, Sy],
-                  [Sx , Sy , N ]]
-      2. Estimate its condition number via the power-iteration-free
-         spectral bound
-             cond ~= max_eig / max(min_eig, eps)
-         where the eigenvalues are computed in closed form for the
-         symmetric 3x3 (cubic from the characteristic polynomial).
-      3. Test for collinearity directly (Sxx*Syy - Sxy^2) ~ 0 after
-         centering -> covariance matrix has a zero eigenvalue, meaning
-         all (x, y) lie on a line.
-
-    If any of these fail, OK=0 and NOTE="PLANEFIT_SINGULAR" is written
-    instead of a bogus rotation.
-    """
-    id_field = _near_table_id_field(near_tbl)
-    samples = {}
-    with arcpy.da.SearchCursor(near_tbl, [id_field, "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
-        for sid, nf, nx, ny in cur:
-            if sid is None or nf is None or nx is None or ny is None:
-                continue
-            sid = int(sid)
-            z = elev_lu.get(int(nf))
-            if z is None:
-                continue
-            samples.setdefault(sid, []).append((float(nx), float(ny), float(z)))
-
-    def _det3(a11, a12, a13, a21, a22, a23, a31, a32, a33):
-        return (a11 * (a22 * a33 - a23 * a32)
-                - a12 * (a21 * a33 - a23 * a31)
-                + a13 * (a21 * a32 - a22 * a31))
-
-    def _sym3_eigenvalues(m11, m12, m13, m22, m23, m33):
-        """
-        Closed-form eigenvalues of a real symmetric 3x3 matrix
-            [[m11, m12, m13],
-             [m12, m22, m23],
-             [m13, m23, m33]]
-        using the trigonometric solution of the characteristic cubic.
-        Returns the three eigenvalues sorted descending.
-        Reference: standard derivation, e.g. Wikipedia
-        "Eigenvalue algorithm" -- Smith's symmetric 3x3 method.
-        """
-        # If the off-diagonals are all (near) zero the matrix is already
-        # diagonal and the eigenvalues are the diagonal entries.
-        p1 = m12 * m12 + m13 * m13 + m23 * m23
-        if p1 < 1e-30:
-            evs = sorted([m11, m22, m33], reverse=True)
-            return evs
-        q = (m11 + m22 + m33) / 3.0
-        p2 = ((m11 - q) ** 2 + (m22 - q) ** 2 + (m33 - q) ** 2) + 2.0 * p1
-        p = math.sqrt(p2 / 6.0)
-        if p == 0.0:
-            evs = sorted([m11, m22, m33], reverse=True)
-            return evs
-        # B = (1/p) * (M - q*I)
-        b11 = (m11 - q) / p
-        b22 = (m22 - q) / p
-        b33 = (m33 - q) / p
-        b12 = m12 / p
-        b13 = m13 / p
-        b23 = m23 / p
-        det_b = _det3(b11, b12, b13, b12, b22, b23, b13, b23, b33)
-        r = det_b / 2.0
-        # Numerical clamping per Smith's algorithm.
-        if r <= -1.0:
-            phi = math.pi / 3.0
-        elif r >= 1.0:
-            phi = 0.0
-        else:
-            phi = math.acos(r) / 3.0
-        eig1 = q + 2.0 * p * math.cos(phi)
-        eig3 = q + 2.0 * p * math.cos(phi + (2.0 * math.pi / 3.0))
-        eig2 = 3.0 * q - eig1 - eig3
-        return sorted([eig1, eig2, eig3], reverse=True)
-
+def _method_nearnormal(spr_fc_proj, offset):
     out = {}
-    COND_LIMIT = 1.0e6  # MASTER RULE constant
-    for sid, pts in samples.items():
-        if len(pts) < 3:
-            out[sid] = (None, 0, "NEED_3PTS")
-            continue
-
-        # Accumulate sums for the normal matrix.
-        sxx = syy = sxy = sx = sy = 0.0
-        sxz = syz = sz = 0.0
-        n = 0.0
-        for x, y, z in pts:
-            n += 1.0
-            sxx += x * x; syy += y * y; sxy += x * y
-            sx += x; sy += y
-            sxz += x * z; syz += y * z; sz += z
-
-        # Collinearity check on the (x, y) cloud (independent of z).
-        # Centered second moments: var_x*var_y - cov_xy^2 ~ 0 -> collinear.
-        if n >= 1.0:
-            mean_x = sx / n
-            mean_y = sy / n
-            var_x = (sxx / n) - (mean_x * mean_x)
-            var_y = (syy / n) - (mean_y * mean_y)
-            cov_xy = (sxy / n) - (mean_x * mean_y)
-            xy_det = var_x * var_y - cov_xy * cov_xy
-            xy_scale = max(abs(var_x), abs(var_y), 1.0)
-            if xy_det <= 1e-12 * xy_scale * xy_scale:
-                out[sid] = (None, 0, "PLANEFIT_SINGULAR")
+    with arcpy.da.SearchCursor(spr_fc_proj, ["SPR_TMPID", "SHAPE@XY", "NEAR_X", "NEAR_Y"]) as cur:
+        for sid, (sx, sy), nx, ny in cur:
+            sid = int(sid)
+            if nx is None or ny is None:
+                out[sid] = _res(None, 0, "NO_NEAR")
                 continue
+            az = _azimuth_geo_deg(nx - sx, ny - sy)
+            if az is None:
+                out[sid] = _res(None, 0, "ZERO")
+            else:
+                out[sid] = _res(_wrap360(az + offset), 1, "OK")
+    return out
 
-        # Eigen-decomposition of the symmetric 3x3 normal matrix to get
-        # the condition number (cond = lambda_max / max(|lambda_min|, eps)).
-        evs = _sym3_eigenvalues(sxx, sxy, sx,
-                                syy, sy,
-                                n)
-        lam_max = max(abs(evs[0]), abs(evs[1]), abs(evs[2]))
-        lam_min = min(abs(evs[0]), abs(evs[1]), abs(evs[2]))
-        if lam_max <= 0.0:
-            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
-            continue
-        if lam_min < (lam_max / COND_LIMIT):
-            # Matrix is effectively rank-deficient.
-            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
-            continue
 
-        # Now the determinant-based solve is numerically safe.
-        D = _det3(sxx, sxy, sx,
-                  sxy, syy, sy,
-                  sx,  sy,  n)
-        if abs(D) < 1e-12 * lam_max:
-            out[sid] = (None, 0, "PLANEFIT_SINGULAR")
-            continue
+# ----- Rank 3 FALLBACK: HighLow (code 03) ------------------------------------
 
-        Da = _det3(sxz, sxy, sx,
-                   syz, syy, sy,
-                   sz,  sy,  n)
-        Db = _det3(sxx, sxz, sx,
-                   sxy, syz, sy,
-                   sx,  sz,  n)
-        a = Da / D
-        b = Db / D
-        # Down-slope direction is -gradient = (-a, -b).
-        if abs(a) < 1e-15 and abs(b) < 1e-15:
-            out[sid] = (None, 0, "ZERO_GRAD")
+def _method_highlow(near_tbl, elev_lu, spr_fc_proj, offset):
+    fallback = _method_nearnormal(spr_fc_proj, offset)
+    samples = _collect_samples(near_tbl, elev_lu, with_dist=False)
+    out = {}
+    for sid, fb in fallback.items():
+        rows = samples.get(sid, [])
+        sc = len(rows)
+        if sc < 2:
+            out[sid] = _res(fb["rot"], 0, "FALLBACK_NEAR_NRM", sc=sc)
+            continue
+        zs = [p[2] for p in rows]
+        zr = max(zs) - min(zs)
+        rows_sorted = sorted(rows, key=lambda t: t[2])
+        low = rows_sorted[0]
+        high = rows_sorted[-1]
+        if high[2] == low[2]:
+            out[sid] = _res(fb["rot"], 0, "FLAT_FALLBACK", sc=sc, zr=zr)
+            continue
+        az = _azimuth_geo_deg(low[0] - high[0], low[1] - high[1])
+        if az is None:
+            out[sid] = _res(fb["rot"], 0, "DEGEN_FALLBACK", sc=sc, zr=zr)
+        else:
+            out[sid] = _res(_wrap360(az + offset), 1, "OK", sc=sc, zr=zr)
+    return out
+
+
+# ----- Rank 2 FINAL_SECONDARY: WeightedPlaneFitAspect (code 02, NEW) ---------
+
+def _method_weighted_planefit_aspect(near_tbl, elev_lu, offset, k_min):
+    """
+    Inverse-distance weighted, CENTERED least-squares plane fit.
+
+      * K nearest contour samples (x, y, z) per spring (+ distance).
+      * weight w = 1 / max(distance, eps); extreme weights are clamped.
+      * centered plane fit z = a*x0 + b*y0 + c (see _solve_centered_plane).
+      * downhill direction = negative gradient (dx, dy) = (-a, -b).
+      * ROT = geographic azimuth (0=N, clockwise).
+
+    Failure notes: NEED_3PTS, PLANEFIT_COLLINEAR, ZERO_GRAD.
+    Also reports CONFIDENCE, Z_RANGE, SAMPLE_COUNT per spring.
+    """
+    EPS = 1e-6
+    samples = _collect_samples(near_tbl, elev_lu, with_dist=True)
+    out = {}
+    for sid, rows in samples.items():
+        sc = len(rows)
+        zs = [r[2] for r in rows]
+        zr = (max(zs) - min(zs)) if zs else 0.0
+        if sc < 3:
+            out[sid] = _res(None, 0, "NEED_3PTS", sc=sc, zr=zr)
+            continue
+        # Inverse-distance weights, clamping extreme (near-zero distance)
+        # weights so a single coincident sample cannot dominate the fit.
+        weights = [1.0 / max(r[3], EPS) for r in rows]
+        sw = sorted(weights)
+        medw = sw[len(sw) // 2]
+        if medw > 0.0:
+            cap = medw * 100.0
+            weights = [w if w <= cap else cap for w in weights]
+        pts = [(r[0], r[1], r[2]) for r in rows]
+        a, b, note = _solve_centered_plane(pts, weights)
+        if note is not None:
+            out[sid] = _res(None, 0, note, sc=sc, zr=zr)
+            continue
+        grad = math.sqrt(a * a + b * b)
+        if grad < 1e-12:
+            out[sid] = _res(None, 0, "ZERO_GRAD", sc=sc, zr=zr)
             continue
         az = _azimuth_geo_deg(-a, -b)
         if az is None:
-            out[sid] = (None, 0, "ZERO_GRAD")
-        else:
-            out[sid] = (_wrap360(az + offset), 1, "OK")
+            out[sid] = _res(None, 0, "ZERO_GRAD", sc=sc, zr=zr)
+            continue
+        # Confidence: blend sample count, z-range, gradient presence and
+        # agreement with the robust centroid-high/low direction.
+        chl = _centroid_hl_az(pts)
+        agree = _ang_diff(az, chl)
+        count_factor = _clamp01(sc / float(k_min)) if k_min > 0 else 1.0
+        zr_factor = (zr / (zr + 1.0)) if zr > 0 else 0.0
+        grad_factor = 1.0
+        agree_factor = (1.0 - (agree / 180.0)) if agree is not None else 0.5
+        conf = _clamp01(
+            (count_factor + zr_factor + grad_factor + agree_factor) / 4.0)
+        out[sid] = _res(_wrap360(az + offset), 1, "OK",
+                        conf=round(conf, 3), zr=zr, sc=sc)
     return out
 
-def _method_05_centroidhl(near_tbl, elev_lu, offset):
-    id_field = _near_table_id_field(near_tbl)
-    samples = {}
-    with arcpy.da.SearchCursor(near_tbl, [id_field, "NEAR_FID", "NEAR_X", "NEAR_Y"]) as cur:
-        for sid, nf, nx, ny in cur:
-            if sid is None or nf is None or nx is None or ny is None:
-                continue
-            sid = int(sid)
-            z = elev_lu.get(int(nf))
-            if z is None:
-                continue
-            samples.setdefault(sid, []).append((float(nx), float(ny), float(z)))
+
+# ----- Rank 1 FINAL_PRIMARY: CentroidHL (code 01) ----------------------------
+
+def _method_centroidhl(near_tbl, elev_lu, offset):
+    samples = _collect_samples(near_tbl, elev_lu, with_dist=False)
     out = {}
     for sid, pts in samples.items():
-        if len(pts) < 4:
-            out[sid] = (None, 0, "NEED_4PTS")
+        sc = len(pts)
+        zs = [p[2] for p in pts]
+        zr = (max(zs) - min(zs)) if zs else 0.0
+        if sc < 4:
+            out[sid] = _res(None, 0, "NEED_4PTS", sc=sc, zr=zr)
             continue
-        zs = sorted([p[2] for p in pts])
-        med = zs[len(zs) // 2]
+        zss = sorted(zs)
+        med = zss[len(zss) // 2]
         high = [p for p in pts if p[2] >= med]
         low = [p for p in pts if p[2] <= med]
         if len(high) == 0 or len(low) == 0:
-            out[sid] = (None, 0, "SPLIT_FAIL")
+            out[sid] = _res(None, 0, "SPLIT_FAIL", sc=sc, zr=zr)
             continue
         hx = sum(p[0] for p in high) / float(len(high))
         hy = sum(p[1] for p in high) / float(len(high))
@@ -776,9 +834,36 @@ def _method_05_centroidhl(near_tbl, elev_lu, offset):
         ly = sum(p[1] for p in low) / float(len(low))
         az = _azimuth_geo_deg(lx - hx, ly - hy)
         if az is None:
-            out[sid] = (None, 0, "DEGEN")
+            out[sid] = _res(None, 0, "DEGEN", sc=sc, zr=zr)
         else:
-            out[sid] = (_wrap360(az + offset), 1, "OK")
+            out[sid] = _res(_wrap360(az + offset), 1, "OK", sc=sc, zr=zr)
+    return out
+
+
+# ----- Legacy alias: old 04_PlaneFit -> fixed centered (unweighted) fit ------
+# The original 04_PlaneFit produced 0/1631 OK on UTM data (false singular).
+# It is no longer emitted as a default output, but this entry point is kept
+# for backward compatibility and now delegates to the stable centered solver.
+
+def _method_planefit_legacy(near_tbl, elev_lu, offset):
+    samples = _collect_samples(near_tbl, elev_lu, with_dist=False)
+    out = {}
+    for sid, pts in samples.items():
+        sc = len(pts)
+        zs = [p[2] for p in pts]
+        zr = (max(zs) - min(zs)) if zs else 0.0
+        a, b, note = _solve_centered_plane(pts, None)
+        if note is not None:
+            out[sid] = _res(None, 0, note, sc=sc, zr=zr)
+            continue
+        if math.sqrt(a * a + b * b) < 1e-12:
+            out[sid] = _res(None, 0, "ZERO_GRAD", sc=sc, zr=zr)
+            continue
+        az = _azimuth_geo_deg(-a, -b)
+        if az is None:
+            out[sid] = _res(None, 0, "ZERO_GRAD", sc=sc, zr=zr)
+        else:
+            out[sid] = _res(_wrap360(az + offset), 1, "OK", sc=sc, zr=zr)
     return out
 
 
@@ -799,11 +884,20 @@ def _write_separate(out_base_fc, out_gdb, out_base_name, method_code, results):
     _ensure_field(out_fc, "ROT", "DOUBLE")
     _ensure_field(out_fc, "OK", "SHORT")
     _ensure_field(out_fc, "NOTE", "TEXT", length=60)
-    with arcpy.da.UpdateCursor(out_fc, ["SPR_TMPID", "ROT", "OK", "NOTE"]) as cur:
-        for sid, rot, ok, note in cur:
-            sid = int(sid)
-            r, o, n = results.get(sid, (None, 0, "NO_DATA"))
-            cur.updateRow([sid, r, o, n])
+    _ensure_field(out_fc, "METHOD_RANK", "SHORT")
+    _ensure_field(out_fc, "METHOD_NAME", "TEXT", length=60)
+    _ensure_field(out_fc, "CONFIDENCE", "DOUBLE")
+    _ensure_field(out_fc, "Z_RANGE", "DOUBLE")
+    _ensure_field(out_fc, "SAMPLE_COUNT", "LONG")
+    rank = METHOD_RANK.get(method_code, 0)
+    flds = ["SPR_TMPID", "ROT", "OK", "NOTE", "METHOD_RANK", "METHOD_NAME",
+            "CONFIDENCE", "Z_RANGE", "SAMPLE_COUNT"]
+    with arcpy.da.UpdateCursor(out_fc, flds) as cur:
+        for row in cur:
+            sid = int(row[0])
+            r = results.get(sid, _res(None, 0, "NO_DATA"))
+            cur.updateRow([sid, r["rot"], r["ok"], r["note"], rank,
+                           method_code, r["conf"], r["zr"], r["sc"]])
     return out_fc
 
 def _write_single_fields(out_fc, results_by_method):
@@ -816,37 +910,128 @@ def _write_single_fields(out_fc, results_by_method):
     field_list = ["SPR_TMPID", "ROT"]
     for m in methods:
         field_list.extend(["ROT_" + m, "OK_" + m, "NOTE_" + m])
+    # Active/primary ROT preference follows rank order when available.
+    ordered = [m for m in METHOD_ORDER if m in results_by_method]
+    ordered += [m for m in methods if m not in ordered]
     with arcpy.da.UpdateCursor(out_fc, field_list) as cur:
         for row in cur:
-            active = None
+            sid = int(row[0])
+            per = {}
             idx = 2
             for m in methods:
-                rot, ok, note = results_by_method[m].get(int(row[0]), (None, 0, "NO_DATA"))
-                row[idx] = rot; row[idx + 1] = ok; row[idx + 2] = note
-                if active is None and rot is not None:
-                    active = rot
+                r = results_by_method[m].get(sid, _res(None, 0, "NO_DATA"))
+                row[idx] = r["rot"]; row[idx + 1] = r["ok"]; row[idx + 2] = r["note"]
+                per[m] = r
                 idx += 3
+            active = None
+            for m in ordered:
+                if per[m]["rot"] is not None:
+                    active = per[m]["rot"]
+                    break
             row[1] = active
             cur.updateRow(row)
 
-def _write_summary_table(out_gdb, base_name, n_total, results_by_method):
-    tbl = os.path.join(out_gdb, _validate_output_name(base_name + "_Summary", out_gdb))
+def _write_ranking_table(out_gdb, out_base_name, n_total, results_by_method, fc_paths):
+    """
+    Method ranking / summary table. One row per method that was run, ordered
+    by rank, with N_OK / N_FAIL / ROT_NONNULL and recommended-use guidance.
+    """
+    name = _validate_output_name(out_base_name + "_MethodRanking", out_gdb)
+    tbl = os.path.join(out_gdb, name)
     _safe_delete(tbl)
-    arcpy.management.CreateTable(out_gdb, os.path.basename(tbl))
-    arcpy.management.AddField(tbl, "METHOD", "TEXT", field_length=40)
+    arcpy.management.CreateTable(out_gdb, name)
+    arcpy.management.AddField(tbl, "METHOD_RANK", "SHORT")
+    arcpy.management.AddField(tbl, "METHOD_NAME", "TEXT", field_length=60)
+    arcpy.management.AddField(tbl, "OUTPUT_FC", "TEXT", field_length=160)
     arcpy.management.AddField(tbl, "N_TOTAL", "LONG")
     arcpy.management.AddField(tbl, "N_OK", "LONG")
     arcpy.management.AddField(tbl, "N_FAIL", "LONG")
-    arcpy.management.AddField(tbl, "OK_PCT", "DOUBLE")
-    with arcpy.da.InsertCursor(tbl, ["METHOD", "N_TOTAL", "N_OK", "N_FAIL", "OK_PCT"]) as ic:
-        for m in results_by_method.keys():
-            ok = 0
-            for sid, (rot, o, note) in results_by_method[m].items():
-                if int(o) == 1:
-                    ok += 1
-            pct = (100.0 * ok / float(n_total)) if n_total > 0 else 0.0
-            ic.insertRow([m, int(n_total), int(ok), int(n_total - ok), float(pct)])
+    arcpy.management.AddField(tbl, "ROT_NONNULL", "LONG")
+    arcpy.management.AddField(tbl, "RECOMMENDED_USE", "TEXT", field_length=30)
+    arcpy.management.AddField(tbl, "NOTES", "TEXT", field_length=254)
+    flds = ["METHOD_RANK", "METHOD_NAME", "OUTPUT_FC", "N_TOTAL", "N_OK",
+            "N_FAIL", "ROT_NONNULL", "RECOMMENDED_USE", "NOTES"]
+    present = [c for c in METHOD_ORDER if c in results_by_method]
+    with arcpy.da.InsertCursor(tbl, flds) as ic:
+        for code in present:
+            mres = results_by_method[code]
+            n_ok = sum(1 for v in mres.values() if int(v["ok"]) == 1)
+            rot_nn = sum(1 for v in mres.values() if v["rot"] is not None)
+            use = METHOD_USE.get(code, "")
+            if n_ok == 0:
+                use = "DEPRECATED_OR_FAILED"
+            ic.insertRow([int(METHOD_RANK.get(code, 0)), code,
+                          os.path.basename(fc_paths.get(code, "")),
+                          int(n_total), int(n_ok), int(n_total - n_ok),
+                          int(rot_nn), use, METHOD_NOTE.get(code, "")])
     return tbl
+
+def _write_suspect_qa(out_base_fc, out_gdb, out_base_name, results_by_method, thresh=45.0):
+    """
+    QA layer of suspicious springs. A spring is a review candidate when the
+    Rank 1 (CentroidHL) rotation disagrees with the Rank 2
+    (WeightedPlaneFitAspect) and/or Rank 3 (HighLow) rotation by more than
+    `thresh` degrees. Suspects are review candidates only; they never fail
+    the tool. Returns (out_fc, n_suspect) or (None, 0) when QA is skipped.
+    """
+    r1 = results_by_method.get(CODE_CENTROIDHL)
+    if r1 is None:
+        arcpy.AddWarning("Suspect QA skipped: Rank 1 (CentroidHL) was not computed.")
+        return None, 0
+    r2 = results_by_method.get(CODE_WPA)
+    r3 = results_by_method.get(CODE_HIGHLOW)
+    if r2 is None and r3 is None:
+        arcpy.AddWarning("Suspect QA skipped: neither Rank 2 nor Rank 3 was computed.")
+        return None, 0
+
+    suspects = {}
+    for sid, v1 in r1.items():
+        if int(v1["ok"]) != 1:
+            continue
+        rot1 = v1["rot"]
+        rot2 = None
+        if r2 is not None:
+            v2 = r2.get(sid)
+            if v2 is not None and int(v2["ok"]) == 1:
+                rot2 = v2["rot"]
+        rot3 = None
+        if r3 is not None:
+            v3 = r3.get(sid)
+            if v3 is not None and int(v3["ok"]) == 1:
+                rot3 = v3["rot"]
+        d12 = _ang_diff(rot1, rot2)
+        d13 = _ang_diff(rot1, rot3)
+        notes = []
+        if d12 is not None and d12 > thresh:
+            notes.append("R1_vs_R2>{0:.0f}".format(thresh))
+        if d13 is not None and d13 > thresh:
+            notes.append("R1_vs_R3>{0:.0f}".format(thresh))
+        if notes:
+            suspects[sid] = (rot1, rot2, rot3, d12, d13, ";".join(notes))
+
+    name = _validate_output_name(out_base_name + "_SuspectRotation_QA", out_gdb)
+    out_fc = os.path.join(out_gdb, name)
+    _safe_delete(out_fc)
+    arcpy.management.CopyFeatures(out_base_fc, out_fc)
+    _ensure_field(out_fc, "ROT_RANK1", "DOUBLE")
+    _ensure_field(out_fc, "ROT_RANK2", "DOUBLE")
+    _ensure_field(out_fc, "ROT_RANK3", "DOUBLE")
+    _ensure_field(out_fc, "DIFF_1_2", "DOUBLE")
+    _ensure_field(out_fc, "DIFF_1_3", "DOUBLE")
+    _ensure_field(out_fc, "NOTE", "TEXT", length=120)
+    flds = ["SPR_TMPID", "ROT_RANK1", "ROT_RANK2", "ROT_RANK3",
+            "DIFF_1_2", "DIFF_1_3", "NOTE"]
+    with arcpy.da.UpdateCursor(out_fc, flds) as cur:
+        for row in cur:
+            sid = int(row[0])
+            if sid not in suspects:
+                cur.deleteRow()
+                continue
+            rot1, rot2, rot3, d12, d13, note = suspects[sid]
+            row[1] = rot1; row[2] = rot2; row[3] = rot3
+            row[4] = d12; row[5] = d13; row[6] = note
+            cur.updateRow(row)
+    return out_fc, len(suspects)
 
 
 # --------------------------
@@ -1030,41 +1215,49 @@ def _run_suite(springs_layer, contours_layer, elev_field, out_gdb, out_base_name
             arcpy.AddMessage("Cache ALL: {0} contours.".format(len(con_geom)))
         _profile_msg(profile, "Cache contours", t0)
 
+    # ---- Compute methods (re-ranked + renamed) --------------------------
+    # Backward-compat toggle mapping (UI parameter names are unchanged):
+    #   run_05 -> 01_Downhill_CentroidHL              (Rank 1, FINAL_PRIMARY)
+    #   run_04 -> 02_Downhill_WeightedPlaneFitAspect   (Rank 2, FINAL_SECONDARY)
+    #   run_02 -> 03_Downhill_HighLow                  (Rank 3, FALLBACK)
+    #   run_01 -> 04_Diagnostic_NearTangent            (DIAGNOSTIC_ONLY)
+    #   run_03 -> 05_Diagnostic_NearNormal             (DIAGNOSTIC_ONLY)
     results = {}
-    if run_01:
-        t0 = time.time()
-        arcpy.AddMessage("Computing 01_NearTangent ...")
-        results["01_NearTangent"] = _method_01_neartangent(spr_p, con_geom, sr_work, tangent_step, global_offset)
-        _profile_msg(profile, "Method 01", t0)
-    if run_02 and need_k:
-        t0 = time.time()
-        arcpy.AddMessage("Computing 02_HighLow ...")
-        results["02_HighLow"] = _method_02_highlow(near_tbl, elev_lu, spr_p, global_offset)
-        _profile_msg(profile, "Method 02", t0)
-    if run_03:
-        t0 = time.time()
-        arcpy.AddMessage("Computing 03_NearNormal ...")
-        results["03_NearNormal"] = _method_03_nearnormal(spr_p, global_offset)
-        _profile_msg(profile, "Method 03", t0)
-    if run_04 and need_k:
-        t0 = time.time()
-        arcpy.AddMessage("Computing 04_PlaneFit ...")
-        results["04_PlaneFit"] = _method_04_planefit(near_tbl, elev_lu, global_offset)
-        _profile_msg(profile, "Method 04", t0)
     if run_05 and need_k:
         t0 = time.time()
-        arcpy.AddMessage("Computing 05_CentroidHL ...")
-        results["05_CentroidHL"] = _method_05_centroidhl(near_tbl, elev_lu, global_offset)
-        _profile_msg(profile, "Method 05", t0)
+        arcpy.AddMessage("Computing {0} (Rank 1, FINAL_PRIMARY) ...".format(CODE_CENTROIDHL))
+        results[CODE_CENTROIDHL] = _method_centroidhl(near_tbl, elev_lu, global_offset)
+        _profile_msg(profile, "Method 01_Downhill_CentroidHL", t0)
+    if run_04 and need_k:
+        t0 = time.time()
+        arcpy.AddMessage("Computing {0} (Rank 2, FINAL_SECONDARY) ...".format(CODE_WPA))
+        results[CODE_WPA] = _method_weighted_planefit_aspect(near_tbl, elev_lu, global_offset, K_MIN_SAMPLES)
+        _profile_msg(profile, "Method 02_Downhill_WeightedPlaneFitAspect", t0)
+    if run_02 and need_k:
+        t0 = time.time()
+        arcpy.AddMessage("Computing {0} (Rank 3, FALLBACK) ...".format(CODE_HIGHLOW))
+        results[CODE_HIGHLOW] = _method_highlow(near_tbl, elev_lu, spr_p, global_offset)
+        _profile_msg(profile, "Method 03_Downhill_HighLow", t0)
+    if run_01:
+        t0 = time.time()
+        arcpy.AddMessage("Computing {0} (DIAGNOSTIC_ONLY) ...".format(CODE_NEARTAN))
+        results[CODE_NEARTAN] = _method_neartangent(spr_p, con_geom, sr_work, tangent_step, global_offset)
+        _profile_msg(profile, "Method 04_Diagnostic_NearTangent", t0)
+    if run_03:
+        t0 = time.time()
+        arcpy.AddMessage("Computing {0} (DIAGNOSTIC_ONLY) ...".format(CODE_NEARNORM))
+        results[CODE_NEARNORM] = _method_nearnormal(spr_p, global_offset)
+        _profile_msg(profile, "Method 05_Diagnostic_NearNormal", t0)
 
     if not results:
-        raise arcpy.ExecuteError("No method selected. Enable at least one of methods 01..05.")
+        raise arcpy.ExecuteError("No method selected. Enable at least one method.")
 
-    # DIAG: per-method OK counts
-    for mname, mres in results.items():
-        ok = sum(1 for v in mres.values() if int(v[1]) == 1)
-        rotated = sum(1 for v in mres.values() if v[0] is not None)
-        arcpy.AddMessage("[DIAG] {0}: rotated={1}  OK={2}  of {3}".format(mname, rotated, ok, n_total))
+    # DIAG: per-method OK counts (rank order)
+    for mcode in [c for c in METHOD_ORDER if c in results]:
+        mres = results[mcode]
+        ok = sum(1 for v in mres.values() if int(v["ok"]) == 1)
+        rotated = sum(1 for v in mres.values() if v["rot"] is not None)
+        arcpy.AddMessage("[DIAG] {0}: rotated={1}  OK={2}  of {3}".format(mcode, rotated, ok, n_total))
 
     # Output base
     t0 = time.time()
@@ -1072,24 +1265,37 @@ def _run_suite(springs_layer, contours_layer, elev_field, out_gdb, out_base_name
     _profile_msg(profile, "Write base output", t0)
 
     out_paths = []
+    fc_paths = {}
     if output_mode == "SINGLE_FIELDS":
         arcpy.AddMessage("Writing SINGLE_FIELDS output...")
         _write_single_fields(out_base_fc, results)
         out_paths.append(out_base_fc)
     else:
         arcpy.AddMessage("Writing SEPARATE_LAYERS outputs...")
-        for method_code in results.keys():
+        for method_code in [c for c in METHOD_ORDER if c in results]:
             out_fc = _write_separate(out_base_fc, out_gdb, out_base_name, method_code, results[method_code])
+            fc_paths[method_code] = out_fc
             out_paths.append(out_fc)
-        _safe_delete(out_base_fc)
 
-    if create_summary:
-        try:
-            tbl = _write_summary_table(out_gdb, out_base_name, n_total, results)
-            out_paths.append(tbl)
-            arcpy.AddMessage("Summary table created: {0}".format(tbl))
-        except Exception:
-            arcpy.AddWarning("Summary table failed (ignored).")
+    # Method ranking table (always created for each run).
+    try:
+        rank_tbl = _write_ranking_table(out_gdb, out_base_name, n_total, results, fc_paths)
+        out_paths.append(rank_tbl)
+        arcpy.AddMessage("Method ranking table created: {0}".format(rank_tbl))
+    except (arcpy.ExecuteError, RuntimeError):
+        arcpy.AddWarning("Method ranking table failed (ignored).")
+
+    # Suspect rotation QA layer (review candidates only; never fails the tool).
+    try:
+        qa_fc, n_suspect = _write_suspect_qa(out_base_fc, out_gdb, out_base_name, results)
+        if qa_fc:
+            out_paths.append(qa_fc)
+            arcpy.AddMessage("Suspect rotation QA layer created ({0} review candidate(s)): {1}".format(n_suspect, qa_fc))
+    except (arcpy.ExecuteError, RuntimeError):
+        arcpy.AddWarning("Suspect QA layer failed (ignored).")
+
+    if output_mode != "SINGLE_FIELDS":
+        _safe_delete(out_base_fc)
 
     # Add to map
     t0 = time.time()
@@ -1186,7 +1392,7 @@ class SpringRotationFinalSuiteTool(object):
         _set_category(p3, CAT_OUT)
         p4 = arcpy.Parameter(displayName="Output feature class base name", name="out_base_name",
                              datatype="GPString", parameterType="Required", direction="Input")
-        p4.value = "springs_rotation_suite"
+        p4.value = "AM_T06"
         _set_category(p4, CAT_OUT)
         p5 = arcpy.Parameter(displayName="Output layout", name="output_mode",
                              datatype="GPString", parameterType="Optional", direction="Input")
@@ -1261,25 +1467,25 @@ class SpringRotationFinalSuiteTool(object):
         p19.value = False
         _set_category(p19, CAT_PERF)
 
-        m01 = arcpy.Parameter(displayName="01 NearTangent - tangent at nearest contour point", name="run_01",
+        m01 = arcpy.Parameter(displayName="Diagnostic: NearTangent - contour tangent (NOT downhill) [legacy 01]", name="run_01",
                               datatype="GPBoolean", parameterType="Optional", direction="Input")
-        m01.value = True
+        m01.value = False
         _set_category(m01, CAT_METH)
-        m02 = arcpy.Parameter(displayName="02 HighLow - high->low vector from K projected contour points", name="run_02",
+        m02 = arcpy.Parameter(displayName="Rank 3 FALLBACK: HighLow - highest->lowest contour vector [legacy 02]", name="run_02",
                               datatype="GPBoolean", parameterType="Optional", direction="Input")
         m02.value = True
         _set_category(m02, CAT_METH)
-        m03 = arcpy.Parameter(displayName="03 NearNormal - spring->nearest contour point", name="run_03",
+        m03 = arcpy.Parameter(displayName="Diagnostic: NearNormal - spring->nearest contour point (not reliable) [legacy 03]", name="run_03",
                               datatype="GPBoolean", parameterType="Optional", direction="Input")
         m03.value = False
         _set_category(m03, CAT_METH)
-        m04 = arcpy.Parameter(displayName="04 PlaneFit - least-squares plane from K samples", name="run_04",
+        m04 = arcpy.Parameter(displayName="Rank 2 SECONDARY: WeightedPlaneFitAspect - fixed centered plane fit [replaces legacy 04 PlaneFit]", name="run_04",
                               datatype="GPBoolean", parameterType="Optional", direction="Input")
-        m04.value = False
+        m04.value = True
         _set_category(m04, CAT_METH)
-        m05 = arcpy.Parameter(displayName="05 CentroidHL - centroid(high)->centroid(low)", name="run_05",
+        m05 = arcpy.Parameter(displayName="Rank 1 PRIMARY: CentroidHL - robust centroid(high)->centroid(low) [legacy 05]", name="run_05",
                               datatype="GPBoolean", parameterType="Optional", direction="Input")
-        m05.value = False
+        m05.value = True
         _set_category(m05, CAT_METH)
 
         outp = arcpy.Parameter(displayName="Outputs (semicolon-separated paths)", name="outputs",
