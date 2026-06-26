@@ -2,9 +2,23 @@
 """
 Plugin 02 - Road Deconflict (ArcMap / Python 2.7)  v6 HARDENED
 ==============================================================
-Non-destructively resolve conflicts between symbol-thickened road centerlines
-and nearby features (points / lines / polygons) by translating those features
-away from the roads until a minimum clearance distance is satisfied.
+Resolve CARTOGRAPHIC / DISPLAY conflicts between symbol-thickened road
+centerlines and nearby features (points / lines / polygons).
+
+IMPORTANT - display displacement is NOT real coordinate editing
+---------------------------------------------------------------
+A thick road symbol visually covers nearby features on the *map* even though
+the real-world coordinates do not overlap. The correct fix is a cartographic
+(display-only) displacement: the *drawn* symbol is nudged for legibility while
+the stored feature coordinates remain exactly where they are. This is
+fundamentally different from editing the real geometry.
+
+This tool computes cartographic/display displacement INSTRUCTIONS for road-
+symbol deconfliction. In the default mode (DISPLAY_ONLY_CARTO_OFFSETS) it
+PRESERVES real feature geometry and writes offset fields (CARTO_*) plus QA
+outputs. It can optionally create clearly-labelled preview-only displaced
+geometry layers. A LEGACY_GEOMETRY_MOVE mode reproduces the old destructive
+behaviour for backward compatibility only (opt-in, not recommended).
 
 v6 hardening (this rewrite, per Master Rules):
   * Exceptions narrowed to (arcpy.ExecuteError, RuntimeError) at GP-call
@@ -1333,6 +1347,675 @@ def _build_near_table_chunked(target_layer_or_path, road_fc, scratch_ws,
 
 
 # =============================================================================
+# 13b. Cartographic / display-offset engine + mode-aware writers
+# =============================================================================
+#
+# CONCEPT - DISPLAY/CARTOGRAPHIC DISPLACEMENT vs REAL COORDINATE EDITING
+# ---------------------------------------------------------------------
+# A symbol-thickened road covers nearby features on the *map*, even though the
+# real-world coordinates do not overlap. The correct fix is a *cartographic*
+# (display-only) displacement: the printed/displayed symbol is nudged for
+# legibility while the stored feature coordinates stay exactly where they are.
+# This is fundamentally different from editing the real geometry.
+#
+# DISPLAY_ONLY_CARTO_OFFSETS (default) therefore NEVER writes SHAPE@ on the
+# main output. It records the offset that a renderer (CIM/lyrx symbol offset,
+# representation override, etc.) would apply, in CARTO_* fields, and optionally
+# builds a clearly-labelled preview-only geometry layer for visual QA.
+# LEGACY_GEOMETRY_MOVE reproduces the old destructive behaviour for backward
+# compatibility only.
+# =============================================================================
+
+MODE_DISPLAY_ONLY = u"DISPLAY_ONLY_CARTO_OFFSETS"
+MODE_PREVIEW_ONLY = u"PREVIEW_GEOMETRY_ONLY"
+MODE_LEGACY = u"LEGACY_GEOMETRY_MOVE"
+DECONFLICT_MODES = [MODE_DISPLAY_ONLY, MODE_PREVIEW_ONLY, MODE_LEGACY]
+
+PLAT_PREFIX = u"AM_T02"
+PREVIEW_WARNING_TEXT = u"CARTOGRAPHIC DISPLAY PREVIEW ONLY - NOT REAL COORDINATES"
+
+
+def _carto_common_specs():
+    return [
+        ("CARTO_MODE", "TEXT", 40),
+        ("CARTO_MOVED", "SHORT", None),
+        ("CARTO_DX", "DOUBLE", None),
+        ("CARTO_DY", "DOUBLE", None),
+        ("CARTO_SHIFT", "DOUBLE", None),
+        ("CARTO_AZIMUTH", "DOUBLE", None),
+        ("CARTO_NOTE", "TEXT", 255),
+        ("CARTO_CONFLICT_BEFORE", "SHORT", None),
+        ("CARTO_CONFLICT_AFTER_PREVIEW", "SHORT", None),
+        ("CARTO_PREVIEW_FC", "TEXT", 255),
+        ("SRC_LAYER", "TEXT", 120),
+        ("SRC_OID", "LONG", None),
+    ]
+
+
+def _carto_point_specs():
+    return _carto_common_specs() + [("ORIG_X", "DOUBLE", None),
+                                    ("ORIG_Y", "DOUBLE", None)]
+
+
+def _carto_centroid_specs():
+    return _carto_common_specs() + [("ORIG_CENTROID_X", "DOUBLE", None),
+                                    ("ORIG_CENTROID_Y", "DOUBLE", None)]
+
+
+def _legacy_point_specs():
+    return [("_RDCL_MOV", "SHORT", None), ("_RDCL_SD", "DOUBLE", None),
+            ("_RDCL_AZ", "DOUBLE", None), ("_RDCL_NOTE", "TEXT", 255)]
+
+
+def _legacy_line_specs():
+    return [("_RDCL_MOV", "SHORT", None), ("_RDCL_SD", "DOUBLE", None),
+            ("_RDCL_NOTE", "TEXT", 255)]
+
+
+def _geom_conflicts(geom, road_buffer_geom, road_geom, clearance):
+    """Real conflict test: does geom touch the symbol-clearance road buffer?"""
+    if geom is None:
+        return False
+    try:
+        return (not road_buffer_geom.disjoint(geom))
+    except (arcpy.ExecuteError, RuntimeError, AttributeError):
+        try:
+            return (road_geom.distanceTo(geom) < clearance)
+        except (arcpy.ExecuteError, RuntimeError, AttributeError):
+            return False
+
+
+def _t02_unique_name(parts, workspace):
+    raw = u"_".join([_safe_unicode(p) for p in parts if p not in (None, u"")])
+    name = _sanitize_name(raw, workspace)
+    if arcpy.Exists(os.path.join(workspace, name)):
+        try:
+            name = arcpy.ValidateTableName(name + "_" + uuid.uuid4().hex[:6], workspace)
+        except (arcpy.ExecuteError, RuntimeError):
+            name = name + "_" + uuid.uuid4().hex[:6]
+    return name
+
+
+def _imap(fields):
+    return dict((f, i) for i, f in enumerate(fields))
+
+
+def _orig_xy(geom, kind):
+    """Original anchor (point coords, or centroid for line/polygon)."""
+    if geom is None:
+        return (None, None)
+    try:
+        if kind == "POINT":
+            p = geom.firstPoint
+            return (p.X, p.Y)
+        c = geom.centroid
+        return (c.firstPoint.X, c.firstPoint.Y)
+    except (AttributeError, RuntimeError):
+        return (None, None)
+
+
+# ---- Proposal engines: compute a displacement WITHOUT mutating SHAPE@ -------
+# Each returns a dict:
+#   moved (bool), dx, dy, shift, azimuth (0=N cw or None), note,
+#   preview_geom (displaced arcpy.Geometry), conflict_before, conflict_after.
+
+def _proposal_point(geom, near_rec, use_near, clearance, road_geom,
+                    road_buffer_geom, max_shift):
+    conflict_before = _geom_conflicts(geom, road_buffer_geom, road_geom, clearance)
+    if use_near and near_rec is not None:
+        ndist, nx, ny = near_rec
+        new_geom, moved, sh, az, note = _push_point_to_clearance_from_near(
+            geom, nx, ny, ndist, clearance, road_geom=road_geom, max_shift=max_shift)
+    else:
+        new_geom, moved, sh, az, note = _push_point_to_clearance(
+            geom, road_geom, clearance, max_shift=max_shift)
+    try:
+        dx = new_geom.firstPoint.X - geom.firstPoint.X
+        dy = new_geom.firstPoint.Y - geom.firstPoint.Y
+    except (AttributeError, RuntimeError):
+        dx = dy = 0.0
+    conflict_after = _geom_conflicts(new_geom, road_buffer_geom, road_geom, clearance)
+    return {"moved": bool(moved), "dx": dx, "dy": dy, "shift": float(sh or 0.0),
+            "azimuth": az, "note": _safe_unicode(note), "preview_geom": new_geom,
+            "conflict_before": conflict_before, "conflict_after": conflict_after}
+
+
+def _proposal_line(geom, clearance, road_geom, road_buffer_geom, line_strategy,
+                   offset_side, densify_step, preserve_endpoints, smooth_iters,
+                   max_shift, max_iter, max_deflection_deg):
+    conflict_before = _geom_conflicts(geom, road_buffer_geom, road_geom, clearance)
+    moved = False
+    still = False
+    note = u""
+    sd_val = 0.0
+    new_geom = geom
+    if line_strategy == "WHOLE_OFFSET":
+        off_dist = clearance
+        if max_shift is not None and max_shift > 0 and max_shift < clearance:
+            off_dist = float(max_shift)
+        new_geom, moved, note = _whole_offset_best_side(
+            geom, road_buffer_geom, off_dist, force_side=offset_side)
+        if not moved:
+            new_geom, moved, max_v_shift, note2, still = _local_push_polyline(
+                geom, road_geom, road_buffer_geom, clearance,
+                densify_step=densify_step, preserve_endpoints=preserve_endpoints,
+                smooth_iters=smooth_iters, max_shift=max_shift, max_iter=max_iter,
+                max_deflection_deg=max_deflection_deg)
+            note = note + u" | Fallback->LocalPush: " + note2
+            sd_val = float(max_v_shift) if moved else 0.0
+        else:
+            try:
+                still = (not road_buffer_geom.disjoint(new_geom))
+            except (arcpy.ExecuteError, RuntimeError, AttributeError):
+                still = False
+            sd_val = float(off_dist) if moved else 0.0
+    else:
+        new_geom, moved, max_v_shift, note, still = _local_push_polyline(
+            geom, road_geom, road_buffer_geom, clearance,
+            densify_step=densify_step, preserve_endpoints=preserve_endpoints,
+            smooth_iters=smooth_iters, max_shift=max_shift, max_iter=max_iter,
+            max_deflection_deg=max_deflection_deg)
+        sd_val = float(max_v_shift) if moved else 0.0
+    dx = dy = 0.0
+    az = None
+    try:
+        p0 = geom.positionAlongLine(0.5, True).firstPoint
+        p1 = new_geom.positionAlongLine(0.5, True).firstPoint
+        dx = p1.X - p0.X
+        dy = p1.Y - p0.Y
+        if abs(dx) > 1e-12 or abs(dy) > 1e-12:
+            az = _azimuth_deg(dx, dy)
+    except (arcpy.ExecuteError, RuntimeError, AttributeError):
+        pass
+    conflict_after = bool(still) or _geom_conflicts(new_geom, road_buffer_geom, road_geom, clearance)
+    return {"moved": bool(moved), "dx": dx, "dy": dy, "shift": float(sd_val or 0.0),
+            "azimuth": az, "note": _safe_unicode(note), "preview_geom": new_geom,
+            "conflict_before": conflict_before, "conflict_after": conflict_after}
+
+
+def _proposal_polygon(geom, near_rec, use_near, clearance, road_geom,
+                      road_buffer_geom, max_shift, max_iter):
+    conflict_before = _geom_conflicts(geom, road_buffer_geom, road_geom, clearance)
+    dist0 = None
+    nx = None
+    ny = None
+    if use_near and near_rec is not None:
+        ndist, nnx, nny = near_rec
+        if ndist is not None:
+            dist0 = float(ndist)
+        nx = nnx
+        ny = nny
+    if dist0 is None:
+        try:
+            dist0 = road_geom.distanceTo(geom)
+        except (arcpy.ExecuteError, RuntimeError, AttributeError):
+            dist0 = 0.0
+    if dist0 >= clearance:
+        return {"moved": False, "dx": 0.0, "dy": 0.0, "shift": 0.0, "azimuth": None,
+                "note": u"OK (no move)", "preview_geom": geom,
+                "conflict_before": conflict_before, "conflict_after": conflict_before}
+    cent = geom.centroid
+    cx = cent.firstPoint.X
+    cy = cent.firstPoint.Y
+    dist_along = None
+    side = None
+    if nx is None or ny is None:
+        p_on, dist_along, _df, side = _nearest_point_and_side(road_geom, cent)
+        try:
+            nx = p_on.firstPoint.X
+            ny = p_on.firstPoint.Y
+        except (AttributeError, RuntimeError):
+            nx = None
+            ny = None
+    vx = (cx - nx) if nx is not None else 0.0
+    vy = (cy - ny) if ny is not None else 0.0
+    vd = math.sqrt(vx * vx + vy * vy)
+    if vd < 1e-9:
+        if dist_along is None:
+            _po, dist_along, _df, side = _nearest_point_and_side(road_geom, cent)
+        tx, ty = _tangent_at_distance(road_geom, dist_along)
+        ux, uy = _unit_normal_from_tangent(tx, ty, side or "LEFT")
+    else:
+        ux, uy = (vx / vd, vy / vd)
+    new_geom, total_shift, still, note = _best_polygon_translation(
+        geom, road_geom, clearance, ux, uy, dist0,
+        dist_along=dist_along, max_shift=max_shift, max_iter=max_iter, side=side)
+    note = _safe_unicode(note)
+    try:
+        if (max_shift is not None and max_shift > 0
+                and total_shift >= (float(max_shift) - 1e-9)):
+            note = note + u" | CAPPED by MaxShift"
+    except (TypeError, ValueError):
+        pass
+    dx = dy = 0.0
+    az = None
+    try:
+        p0 = geom.centroid.firstPoint
+        p1 = new_geom.centroid.firstPoint
+        dx = p1.X - p0.X
+        dy = p1.Y - p0.Y
+        if abs(dx) > 1e-12 or abs(dy) > 1e-12:
+            az = _azimuth_deg(dx, dy)
+    except (arcpy.ExecuteError, RuntimeError, AttributeError):
+        pass
+    conflict_after = bool(still) or _geom_conflicts(new_geom, road_buffer_geom, road_geom, clearance)
+    return {"moved": True, "dx": dx, "dy": dy, "shift": float(total_shift or 0.0),
+            "azimuth": az, "note": note, "preview_geom": new_geom,
+            "conflict_before": conflict_before, "conflict_after": conflict_after}
+
+
+# ---- QA self-check: main output geometry must be byte-identical to source ---
+
+def _assert_geometry_unchanged(ref_fc, out_fc, mode):
+    """In DISPLAY_ONLY / PREVIEW_ONLY the main output must be geometrically
+    identical to its pre-processing copy (ref_fc). Streams both feature classes
+    positionally and raises DISPLAY_ONLY_GEOMETRY_CHANGED on any mismatch.
+    Legacy mode is exempt (it intentionally moves geometry)."""
+    if mode == MODE_LEGACY or not ref_fc:
+        return
+    rc = arcpy.da.SearchCursor(ref_fc, ["SHAPE@"])
+    oc = arcpy.da.SearchCursor(out_fc, ["SHAPE@"])
+    try:
+        while True:
+            try:
+                rrow = rc.next()
+            except StopIteration:
+                rrow = None
+            try:
+                orow = oc.next()
+            except StopIteration:
+                orow = None
+            if rrow is None and orow is None:
+                break
+            if rrow is None or orow is None:
+                raise arcpy.ExecuteError(
+                    u"DISPLAY_ONLY_GEOMETRY_CHANGED: output feature count differs "
+                    u"from source in mode {0}.".format(mode))
+            rg = rrow[0]
+            og = orow[0]
+            if rg is None and og is None:
+                continue
+            same = False
+            try:
+                same = bool(rg.equals(og))
+            except (arcpy.ExecuteError, RuntimeError, AttributeError):
+                same = (getattr(rg, "JSON", None) == getattr(og, "JSON", None))
+            if not same:
+                raise arcpy.ExecuteError(
+                    u"DISPLAY_ONLY_GEOMETRY_CHANGED: main output geometry differs "
+                    u"from source in mode {0}.".format(mode))
+    finally:
+        try:
+            del rc
+        except (NameError, RuntimeError):
+            pass
+        try:
+            del oc
+        except (NameError, RuntimeError):
+            pass
+
+
+# ---- Global QA feature classes (shared across all target layers) ------------
+
+class _Ctx(object):
+    """Lightweight shared context for the per-layer processors."""
+    pass
+
+
+def _make_global_qa_fcs(ctx, create_errors, create_vectors):
+    ctx.vec_fc = None
+    ctx.conf_before_fc = None
+    ctx.conf_after_fc = None
+    ctx.err_fc = None
+    if create_vectors:
+        vname = _t02_unique_name([ctx.plat_prefix, u"DisplacementVectors_QA"], ctx.out_gdb)
+        ctx.vec_fc = os.path.join(ctx.out_gdb, vname)
+        _gp_try(arcpy.CreateFeatureclass_management,
+                [ctx.out_gdb, vname, "POLYLINE"], {"spatial_reference": ctx.sr})
+        _ensure_fields(ctx.vec_fc, [
+            ("SRC_LAYER", "TEXT", 120), ("SRC_OID", "LONG", None),
+            ("KIND", "TEXT", 20), ("SHIFT", "DOUBLE", None),
+            ("AZIMUTH", "DOUBLE", None), ("CARTO_DX", "DOUBLE", None),
+            ("CARTO_DY", "DOUBLE", None)])
+    cbname = _t02_unique_name([ctx.plat_prefix, u"Conflicts_Before"], ctx.out_gdb)
+    ctx.conf_before_fc = os.path.join(ctx.out_gdb, cbname)
+    _gp_try(arcpy.CreateFeatureclass_management,
+            [ctx.out_gdb, cbname, "POINT"], {"spatial_reference": ctx.sr})
+    _ensure_fields(ctx.conf_before_fc, [
+        ("SRC_LAYER", "TEXT", 120), ("SRC_OID", "LONG", None),
+        ("KIND", "TEXT", 20), ("STAGE", "TEXT", 20)])
+    caname = _t02_unique_name([ctx.plat_prefix, u"Conflicts_AfterPreview"], ctx.out_gdb)
+    ctx.conf_after_fc = os.path.join(ctx.out_gdb, caname)
+    _gp_try(arcpy.CreateFeatureclass_management,
+            [ctx.out_gdb, caname, "POINT"], {"spatial_reference": ctx.sr})
+    _ensure_fields(ctx.conf_after_fc, [
+        ("SRC_LAYER", "TEXT", 120), ("SRC_OID", "LONG", None),
+        ("KIND", "TEXT", 20), ("STAGE", "TEXT", 20)])
+    if create_errors:
+        ename = _t02_unique_name([ctx.plat_prefix, u"Errors_QA"], ctx.out_gdb)
+        ctx.err_fc = os.path.join(ctx.out_gdb, ename)
+        _gp_try(arcpy.CreateFeatureclass_management,
+                [ctx.out_gdb, ename, "POINT"], {"spatial_reference": ctx.sr})
+        _ensure_fields(ctx.err_fc, [
+            ("SRC_LAYER", "TEXT", 120), ("SRC_OID", "LONG", None),
+            ("KIND", "TEXT", 20), ("ERR_CODE", "TEXT", 60),
+            ("DETAIL", "TEXT", 255)])
+
+
+def _make_report_table(ctx):
+    rname = _t02_unique_name([ctx.plat_prefix, u"Report"], ctx.out_gdb)
+    ctx.report_fc = os.path.join(ctx.out_gdb, rname)
+    _gp_try(arcpy.CreateTable_management, [ctx.out_gdb, rname])
+    _ensure_fields(ctx.report_fc, [
+        ("LAYER", "TEXT", 160), ("KIND", "TEXT", 20), ("MODE", "TEXT", 40),
+        ("N_TOTAL", "LONG", None), ("N_CONFLICT_BEFORE", "LONG", None),
+        ("N_CARTO_MOVED", "LONG", None), ("N_CONFLICT_AFTER_PREVIEW", "LONG", None),
+        ("REAL_GEOMETRY_STATUS", "TEXT", 40), ("PREVIEW_FC", "TEXT", 255)])
+
+
+# ---- The mode-aware per-layer processor -------------------------------------
+
+def _process_target_layer(ctx, lyr, kind):
+    """kind in {'POINT','LINE','POLYGON'}. Computes cartographic display offsets
+    and writes mode-appropriate outputs. NEVER mutates the main output SHAPE@
+    unless ctx.mode == LEGACY."""
+    shape_req = {"POINT": "POINT", "LINE": "POLYLINE", "POLYGON": "POLYGON"}[kind]
+    src = _resolve_full_source(lyr)
+    desc = arcpy.Describe(src)
+    if desc.shapeType.upper() != shape_req:
+        _warn(u"Skipping (not {0}): {1}".format(shape_req, lyr))
+        return None
+    layer_base = os.path.basename(desc.catalogPath)
+
+    main_kind_label = u"LegacyGeometryMoved" if ctx.mode == MODE_LEGACY else u"CartoOffsets"
+    out_name = _t02_unique_name([ctx.plat_prefix, layer_base, main_kind_label], ctx.out_gdb)
+    out_fc = os.path.join(ctx.out_gdb, out_name)
+    _msg(u"Copy {0} -> {1}".format(kind.lower(), out_fc))
+    _copy_or_project(src, out_fc, ctx.sr)
+    if kind == "POINT":
+        _ensure_fields(out_fc, _legacy_point_specs())
+        _ensure_fields(out_fc, _carto_point_specs())
+    else:
+        _ensure_fields(out_fc, _legacy_line_specs())
+        _ensure_fields(out_fc, _carto_centroid_specs())
+    total = _get_count(out_fc)
+    _diag(u"{0} '{1}': total={2}".format(kind, desc.name, total))
+
+    # QA snapshot (pre-processing copy) for the geometry-unchanged self-check.
+    snap_fc = None
+    if ctx.mode != MODE_LEGACY:
+        snap_fc = os.path.join(ctx.scratch_ws, "rdcl_snap_" + uuid.uuid4().hex[:6])
+        try:
+            _gp_try(arcpy.CopyFeatures_management, [out_fc, snap_fc])
+        except (arcpy.ExecuteError, RuntimeError):
+            snap_fc = None
+
+    # Preview-only displaced geometry FC?
+    want_preview = (ctx.mode == MODE_PREVIEW_ONLY) or \
+                   (ctx.mode == MODE_DISPLAY_ONLY and ctx.create_preview)
+    preview_fc = None
+    preview_name = u""
+    if want_preview:
+        preview_name = _t02_unique_name([ctx.plat_prefix, layer_base, u"DisplayPreview"], ctx.out_gdb)
+        preview_fc = os.path.join(ctx.out_gdb, preview_name)
+        _gp_try(arcpy.CreateFeatureclass_management,
+                [ctx.out_gdb, preview_name, shape_req], {"spatial_reference": ctx.sr})
+        _ensure_fields(preview_fc, [
+            ("PREVIEW_ONLY", "SHORT", None), ("PREVIEW_WARNING", "TEXT", 120),
+            ("SRC_LAYER", "TEXT", 120), ("SRC_OID", "LONG", None),
+            ("CARTO_DX", "DOUBLE", None), ("CARTO_DY", "DOUBLE", None),
+            ("CARTO_SHIFT", "DOUBLE", None), ("CARTO_AZIMUTH", "DOUBLE", None),
+            ("CARTO_CONFLICT_AFTER_PREVIEW", "SHORT", None)])
+
+    # ---- Pass A: initialise CARTO/legacy fields for ALL features (no SHAPE@) -
+    orig_field = ("ORIG_X" if kind == "POINT" else "ORIG_CENTROID_X")
+    orig_field_y = ("ORIG_Y" if kind == "POINT" else "ORIG_CENTROID_Y")
+    initA = ["OID@", "SHAPE@", "CARTO_MODE", "CARTO_MOVED", "CARTO_DX", "CARTO_DY",
+             "CARTO_SHIFT", "CARTO_AZIMUTH", "CARTO_NOTE", "CARTO_CONFLICT_BEFORE",
+             "CARTO_CONFLICT_AFTER_PREVIEW", "CARTO_PREVIEW_FC", "SRC_LAYER", "SRC_OID",
+             orig_field, orig_field_y, "_RDCL_MOV", "_RDCL_SD", "_RDCL_NOTE"]
+    if kind == "POINT":
+        initA.append("_RDCL_AZ")
+    ia = _imap(initA)
+    with arcpy.da.UpdateCursor(out_fc, initA) as cur:
+        for row in cur:
+            oid = row[0]
+            g = row[1]
+            ox, oy = _orig_xy(g, kind)
+            row[ia["CARTO_MODE"]] = ctx.mode
+            row[ia["CARTO_MOVED"]] = 0
+            row[ia["CARTO_DX"]] = 0.0
+            row[ia["CARTO_DY"]] = 0.0
+            row[ia["CARTO_SHIFT"]] = 0.0
+            row[ia["CARTO_AZIMUTH"]] = None
+            row[ia["CARTO_NOTE"]] = u"OK (no conflict)"
+            row[ia["CARTO_CONFLICT_BEFORE"]] = 0
+            row[ia["CARTO_CONFLICT_AFTER_PREVIEW"]] = 0
+            row[ia["CARTO_PREVIEW_FC"]] = preview_name
+            row[ia["SRC_LAYER"]] = _safe_unicode(desc.name)
+            row[ia["SRC_OID"]] = oid
+            row[ia[orig_field]] = ox
+            row[ia[orig_field_y]] = oy
+            row[ia["_RDCL_MOV"]] = 0
+            row[ia["_RDCL_SD"]] = 0.0
+            row[ia["_RDCL_NOTE"]] = u"OK (no conflict)"
+            if kind == "POINT":
+                row[ia["_RDCL_AZ"]] = None
+            cur.updateRow(row)
+
+    # ---- Candidate subset within the clearance buffer -----------------------
+    tmp_lyr = "t02lyr_" + uuid.uuid4().hex[:6]
+    _gp_try(arcpy.MakeFeatureLayer_management, [out_fc, tmp_lyr])
+    _gp_try(arcpy.SelectLayerByLocation_management, [tmp_lyr, "INTERSECT", ctx.buf_fc])
+    cand_count = _get_count(tmp_lyr)
+    _diag(u"{0} '{1}': in clearance buffer={2}".format(kind, desc.name, cand_count))
+
+    near_dict = {}
+    if kind in ("POINT", "POLYGON") and ctx.use_near and cand_count > 0:
+        nd = _build_near_table_chunked(tmp_lyr, ctx.diss_fc, ctx.scratch_ws, ctx.near_chunk_size)
+        if nd is None:
+            _warn(u"GenerateNearTable failed for {0}; falling back to per-feature "
+                  u"geometry queries.".format(kind.lower()))
+        else:
+            near_dict = nd
+
+    has_lock = bool(ctx.lock_field and arcpy.ListFields(out_fc, ctx.lock_field))
+    fields = (["OID@", "SHAPE@"] + ([ctx.lock_field] if has_lock else []) + [
+        "CARTO_MOVED", "CARTO_DX", "CARTO_DY", "CARTO_SHIFT", "CARTO_AZIMUTH",
+        "CARTO_NOTE", "CARTO_CONFLICT_BEFORE", "CARTO_CONFLICT_AFTER_PREVIEW",
+        "_RDCL_MOV", "_RDCL_SD", "_RDCL_NOTE"] +
+        (["_RDCL_AZ"] if kind == "POINT" else []))
+    fm = _imap(fields)
+    i_shape = fm["SHAPE@"]
+    i_lock = fm[ctx.lock_field] if has_lock else None
+
+    moved_cnt = 0
+    conflict_before_cnt = 0
+    conflict_after_cnt = 0
+    preview_rows = []
+    vector_rows = []
+    confb_rows = []
+    confa_rows = []
+    error_rows = []
+
+    _prog_start(u"Display-deconfliction ({0}): {1}".format(kind.lower(), desc.name), cand_count)
+    try:
+        with arcpy.da.UpdateCursor(tmp_lyr, fields) as cur:
+            for row in cur:
+                _prog_tick()
+                oid = row[0]
+                geom = row[i_shape]
+                if geom is None:
+                    error_rows.append((None, _safe_unicode(desc.name), oid, kind,
+                                       "GEOM_NULL", "Null geometry"))
+                    continue
+                ox, oy = _orig_xy(geom, kind)
+
+                # Locked features: CARTO_MOVED=0, CARTO_NOTE=LOCKED.
+                if has_lock:
+                    try:
+                        if row[i_lock] == 0:
+                            row[fm["CARTO_MOVED"]] = 0
+                            row[fm["CARTO_DX"]] = 0.0
+                            row[fm["CARTO_DY"]] = 0.0
+                            row[fm["CARTO_SHIFT"]] = 0.0
+                            row[fm["CARTO_AZIMUTH"]] = None
+                            row[fm["CARTO_NOTE"]] = u"LOCKED"
+                            row[fm["CARTO_CONFLICT_BEFORE"]] = 1
+                            row[fm["CARTO_CONFLICT_AFTER_PREVIEW"]] = 1
+                            row[fm["_RDCL_MOV"]] = 0
+                            row[fm["_RDCL_SD"]] = 0.0
+                            row[fm["_RDCL_NOTE"]] = u"LOCKED (0)"
+                            if kind == "POINT":
+                                row[fm["_RDCL_AZ"]] = None
+                            cur.updateRow(row)
+                            conflict_before_cnt += 1
+                            conflict_after_cnt += 1
+                            confb_rows.append((ox, oy, _safe_unicode(desc.name), oid, kind, "BEFORE"))
+                            confa_rows.append((ox, oy, _safe_unicode(desc.name), oid, kind, "AFTER_PREVIEW"))
+                            ctx.audit(kind, desc.name, oid, False, 0.0, None,
+                                      u"LOCKED", 1, 1, ctx.mode, preview_name)
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+
+                # Compute the displacement proposal (no SHAPE@ mutation yet).
+                if kind == "POINT":
+                    prop = _proposal_point(geom, near_dict.get(int(oid)), ctx.use_near,
+                                           ctx.clearance, ctx.road_geom,
+                                           ctx.road_buffer_geom, ctx.max_shift)
+                elif kind == "LINE":
+                    prop = _proposal_line(geom, ctx.clearance, ctx.road_geom,
+                                          ctx.road_buffer_geom, ctx.line_strategy,
+                                          ctx.offset_side, ctx.densify_step,
+                                          ctx.preserve_endpoints, ctx.smooth_iters,
+                                          ctx.max_shift, ctx.max_iter, ctx.max_deflection_deg)
+                else:
+                    prop = _proposal_polygon(geom, near_dict.get(int(oid)), ctx.use_near,
+                                             ctx.clearance, ctx.road_geom,
+                                             ctx.road_buffer_geom, ctx.max_shift, ctx.max_iter)
+
+                moved = prop["moved"]
+                dx = prop["dx"]
+                dy = prop["dy"]
+                shift = prop["shift"]
+                az = prop["azimuth"]
+                note = prop["note"]
+                cb = 1 if prop["conflict_before"] else 0
+                ca = 1 if prop["conflict_after"] else 0
+
+                row[fm["CARTO_MOVED"]] = 1 if moved else 0
+                row[fm["CARTO_DX"]] = dx
+                row[fm["CARTO_DY"]] = dy
+                row[fm["CARTO_SHIFT"]] = float(shift)
+                row[fm["CARTO_AZIMUTH"]] = az if az is not None else None
+                row[fm["CARTO_NOTE"]] = note
+                row[fm["CARTO_CONFLICT_BEFORE"]] = cb
+                row[fm["CARTO_CONFLICT_AFTER_PREVIEW"]] = ca
+                row[fm["_RDCL_MOV"]] = 1 if moved else 0
+                row[fm["_RDCL_SD"]] = float(shift)
+                row[fm["_RDCL_NOTE"]] = note
+                if kind == "POINT":
+                    row[fm["_RDCL_AZ"]] = az if az is not None else None
+
+                # LEGACY mode (and ONLY legacy) physically moves output geometry.
+                if ctx.mode == MODE_LEGACY and moved and prop["preview_geom"] is not None:
+                    row[i_shape] = prop["preview_geom"]
+
+                cur.updateRow(row)
+
+                if cb:
+                    conflict_before_cnt += 1
+                    confb_rows.append((ox, oy, _safe_unicode(desc.name), oid, kind, "BEFORE"))
+                if ca:
+                    conflict_after_cnt += 1
+                    px = (ox + dx) if (ox is not None) else None
+                    py = (oy + dy) if (oy is not None) else None
+                    confa_rows.append((px, py, _safe_unicode(desc.name), oid, kind, "AFTER_PREVIEW"))
+                if moved:
+                    moved_cnt += 1
+                    if shift > 0 and ox is not None:
+                        vector_rows.append((ox, oy, ox + dx, oy + dy,
+                                            _safe_unicode(desc.name), oid, kind,
+                                            float(shift), az, dx, dy))
+                    if preview_fc is not None and prop["preview_geom"] is not None:
+                        preview_rows.append((prop["preview_geom"], _safe_unicode(desc.name),
+                                             oid, dx, dy, float(shift), az, ca))
+                if ca:
+                    error_rows.append((ox, oy, _safe_unicode(desc.name), oid, kind,
+                                       "STILL_CONFLICT", "Display offset could not clear road buffer"))
+                ctx.audit(kind, desc.name, oid, moved, shift, az, note, cb, ca, ctx.mode, preview_name)
+    finally:
+        _prog_end()
+    _safe_delete(tmp_lyr)
+    tmp_lyr = None
+
+    # ---- Bulk-insert QA rows (after the main UpdateCursor is closed) --------
+    if preview_fc is not None and preview_rows:
+        with arcpy.da.InsertCursor(preview_fc, [
+                "SHAPE@", "SRC_LAYER", "SRC_OID", "CARTO_DX", "CARTO_DY",
+                "CARTO_SHIFT", "CARTO_AZIMUTH", "CARTO_CONFLICT_AFTER_PREVIEW",
+                "PREVIEW_ONLY", "PREVIEW_WARNING"]) as ic:
+            for (g, slyr, soid, pdx, pdy, psh, paz, pca) in preview_rows:
+                ic.insertRow([g, slyr, soid, pdx, pdy, psh,
+                              (paz if paz is not None else None), pca,
+                              1, PREVIEW_WARNING_TEXT])
+    if ctx.vec_fc and vector_rows:
+        with arcpy.da.InsertCursor(ctx.vec_fc, [
+                "SHAPE@", "SRC_LAYER", "SRC_OID", "KIND", "SHIFT", "AZIMUTH",
+                "CARTO_DX", "CARTO_DY"]) as ic:
+            for (x0, y0, x1, y1, slyr, soid, k, sh, az, ddx, ddy) in vector_rows:
+                try:
+                    vg = arcpy.Polyline(arcpy.Array([arcpy.Point(x0, y0),
+                                                     arcpy.Point(x1, y1)]), ctx.sr)
+                    ic.insertRow([vg, slyr, soid, k, sh,
+                                  (az if az is not None else None), ddx, ddy])
+                except (arcpy.ExecuteError, RuntimeError):
+                    pass
+    if ctx.conf_before_fc and confb_rows:
+        with arcpy.da.InsertCursor(ctx.conf_before_fc, [
+                "SHAPE@", "SRC_LAYER", "SRC_OID", "KIND", "STAGE"]) as ic:
+            for (x, y, slyr, soid, k, stg) in confb_rows:
+                if x is None or y is None:
+                    continue
+                ic.insertRow([arcpy.PointGeometry(arcpy.Point(x, y), ctx.sr), slyr, soid, k, stg])
+    if ctx.conf_after_fc and confa_rows:
+        with arcpy.da.InsertCursor(ctx.conf_after_fc, [
+                "SHAPE@", "SRC_LAYER", "SRC_OID", "KIND", "STAGE"]) as ic:
+            for (x, y, slyr, soid, k, stg) in confa_rows:
+                if x is None or y is None:
+                    continue
+                ic.insertRow([arcpy.PointGeometry(arcpy.Point(x, y), ctx.sr), slyr, soid, k, stg])
+    if ctx.err_fc and error_rows:
+        with arcpy.da.InsertCursor(ctx.err_fc, [
+                "SHAPE@", "SRC_LAYER", "SRC_OID", "KIND", "ERR_CODE", "DETAIL"]) as ic:
+            for (x, y, slyr, soid, k, code, detail) in error_rows:
+                geom = None
+                if x is not None and y is not None:
+                    geom = arcpy.PointGeometry(arcpy.Point(x, y), ctx.sr)
+                ic.insertRow([geom, slyr, soid, k, code, detail])
+
+    if not ctx.keep_near_fields and kind in ("POINT", "POLYGON"):
+        _delete_near_fields(out_fc)
+
+    # ---- QA self-check: geometry must be unchanged in non-legacy modes ------
+    try:
+        _assert_geometry_unchanged(snap_fc, out_fc, ctx.mode)
+    finally:
+        _safe_delete(snap_fc)
+
+    real_status = (u"MOVED_LEGACY" if ctx.mode == MODE_LEGACY else u"UNCHANGED")
+    ctx.report_rows.append({
+        "layer": _safe_unicode(desc.name), "kind": kind, "mode": ctx.mode,
+        "total": int(total), "cb": int(conflict_before_cnt),
+        "moved": int(moved_cnt), "ca": int(conflict_after_cnt),
+        "real_status": real_status, "preview_fc": preview_name})
+    _diag(u"{0} '{1}': conflict_before={2}, carto_moved={3}, conflict_after_preview={4}".format(
+        kind, desc.name, conflict_before_cnt, moved_cnt, conflict_after_cnt))
+    return out_fc
+
+
+# =============================================================================
 # 14. Toolbox / Tool
 # =============================================================================
 
@@ -1351,9 +2034,20 @@ class RoadDeconflictTool(object):
     """Main GP tool - hardened v6 (per Master Rules)."""
 
     def __init__(self):
-        self.label = u"Deconflict Roads vs Nearby Features (Points/Lines/Polygons) - v6"
+        self.label = u"Deconflict Roads vs Nearby Features (Display/Cartographic Offsets) - v6"
         self.description = (
-            u"Moves nearby features away from roads to enforce a clearance distance.\n\n"
+            u"Computes cartographic/display displacement instructions for road-symbol "
+            u"deconfliction. In the default mode (DISPLAY_ONLY_CARTO_OFFSETS) it PRESERVES "
+            u"real feature geometry and writes offset fields (CARTO_*) plus QA outputs. It "
+            u"can optionally create preview-only displaced geometry layers. Display "
+            u"displacement is NOT real coordinate editing.\n\n"
+            u"Deconflict Output Mode:\n"
+            u" - DISPLAY_ONLY_CARTO_OFFSETS (default, recommended): main output geometry is "
+            u"never changed; only CARTO_* offset fields are written.\n"
+            u" - PREVIEW_GEOMETRY_ONLY: also build clearly-labelled preview-only displaced "
+            u"geometry feature classes for visual QA (main geometry still unchanged).\n"
+            u" - LEGACY_GEOMETRY_MOVE: legacy/destructive behaviour that physically moves "
+            u"output SHAPE@ (opt-in, NOT recommended).\n\n"
             u"v6 hardening:\n"
             u" - Exception handling narrowed; MemoryError/OSError propagate.\n"
             u" - Nearest-distance work runs ONCE via GenerateNearTable, not "
@@ -1361,8 +2055,7 @@ class RoadDeconflictTool(object):
             u" - True-curve arc segments are preserved during translation.\n"
             u" - GP env knobs are snapshotted/reset/restored per run.\n"
             u" - SELECTION-BYPASS hardwired: full datasets are always processed.\n"
-            u" - All large intermediates land in scratchGDB (disk).\n"
-            u" - Stage-by-stage [DIAG] logging (total -> in-AOI -> in-buffer -> moved -> still_conflict)."
+            u" - All large intermediates land in scratchGDB (disk)."
         )
         self.canRunInBackground = True
 
@@ -1379,17 +2072,17 @@ class RoadDeconflictTool(object):
         p1.category = "01 Inputs"
         p1.value = 6.0
 
-        p2 = arcpy.Parameter(displayName=u"Point Layers to Move (optional)",
+        p2 = arcpy.Parameter(displayName=u"Point Layers to Display-Deconflict (optional)",
                              name="in_points", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
         p2.category = "01 Inputs"
 
-        p3 = arcpy.Parameter(displayName=u"Line Layers to Move (optional)",
+        p3 = arcpy.Parameter(displayName=u"Line Layers to Display-Deconflict (optional)",
                              name="in_lines", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
         p3.category = "01 Inputs"
 
-        p4 = arcpy.Parameter(displayName=u"Polygon Layers to Move (optional)",
+        p4 = arcpy.Parameter(displayName=u"Polygon Layers to Display-Deconflict (optional)",
                              name="in_polygons", datatype="GPFeatureLayer",
                              parameterType="Optional", direction="Input", multiValue=True)
         p4.category = "01 Inputs"
@@ -1511,9 +2204,28 @@ class RoadDeconflictTool(object):
         p21.value = False
         p21.enabled = False
 
+        # ---- NEW v6 (cartographic/display) parameters appended at the end so
+        # existing parameter indices 0..22 are preserved for saved models. ----
+        p23 = arcpy.Parameter(displayName=u"Deconflict Output Mode",
+                              name="deconflict_mode", datatype="GPString",
+                              parameterType="Required", direction="Input")
+        p23.category = "01 Inputs"
+        try:
+            p23.filter.type = "ValueList"
+            p23.filter.list = [MODE_DISPLAY_ONLY, MODE_PREVIEW_ONLY, MODE_LEGACY]
+        except (AttributeError, RuntimeError):
+            pass
+        p23.value = MODE_DISPLAY_ONLY
+
+        p24 = arcpy.Parameter(displayName=u"Create Preview-Only Displaced Geometry Layers (visual QA)",
+                              name="create_preview", datatype="GPBoolean",
+                              parameterType="Optional", direction="Input")
+        p24.category = "04 QC / Reporting"
+        p24.value = False
+
         return [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9,
                 p10, p11, p12, p13, p14, p15, p16, p17, p18, p19,
-                p20, p21, p22]
+                p20, p21, p22, p23, p24]
 
     def isLicensed(self):
         return True
@@ -1558,6 +2270,18 @@ class RoadDeconflictTool(object):
             if not parameters[21].enabled:
                 parameters[21].value = False
         except (AttributeError, RuntimeError):
+            pass
+        # New v6: Create-Preview flag is only meaningful in DISPLAY_ONLY mode.
+        # In PREVIEW_GEOMETRY_ONLY preview layers are always built; in
+        # LEGACY_GEOMETRY_MOVE there is no preview concept.
+        try:
+            mode_val = parameters[23].valueAsText or MODE_DISPLAY_ONLY
+            parameters[24].enabled = (mode_val == MODE_DISPLAY_ONLY)
+            if mode_val == MODE_PREVIEW_ONLY:
+                parameters[24].value = True
+            elif mode_val == MODE_LEGACY:
+                parameters[24].value = False
+        except (AttributeError, RuntimeError, IndexError):
             pass
         c = _safe_float(parameters[1].value, None)
         if c is not None and c <= 0:
@@ -1828,587 +2552,168 @@ class RoadDeconflictTool(object):
             if road_buffer_geom is None:
                 raise arcpy.ExecuteError(u"Failed to read road buffer geometry.")
 
-            # Error / vector FCs
-            err_pts_fc = err_lns_fc = err_pol_fc = None
-            if create_errors:
-                err_pts_name = _new_name("RDCL_ErrPoints", suffix, out_gdb)
-                err_lns_name = _new_name("RDCL_ErrLines", suffix, out_gdb)
-                err_pol_name = _new_name("RDCL_ErrPolys", suffix, out_gdb)
-                err_pts_fc = os.path.join(out_gdb, err_pts_name)
-                err_lns_fc = os.path.join(out_gdb, err_lns_name)
-                err_pol_fc = os.path.join(out_gdb, err_pol_name)
-                _gp_try(arcpy.CreateFeatureclass_management,
-                        [out_gdb, err_pts_name, "POINT"], {"spatial_reference": sr})
-                _gp_try(arcpy.CreateFeatureclass_management,
-                        [out_gdb, err_lns_name, "POLYLINE"], {"spatial_reference": sr})
-                _gp_try(arcpy.CreateFeatureclass_management,
-                        [out_gdb, err_pol_name, "POLYGON"], {"spatial_reference": sr})
-                for fc in (err_pts_fc, err_lns_fc, err_pol_fc):
-                    _ensure_fields(fc, [
-                        ("SRC_LAYER", "TEXT", 120),
-                        ("SRC_OID", "LONG", None),
-                        ("ERR_CODE", "TEXT", 60),
-                        ("DETAIL", "TEXT", 255),
-                    ])
-            vec_fc = None
-            if create_vectors:
-                vec_name = _new_name("RDCL_DisplacementVectors", suffix, out_gdb)
-                vec_fc = os.path.join(out_gdb, vec_name)
-                _gp_try(arcpy.CreateFeatureclass_management,
-                        [out_gdb, vec_name, "POLYLINE"], {"spatial_reference": sr})
-                _ensure_fields(vec_fc, [
-                    ("SRC_LAYER", "TEXT", 120),
-                    ("SRC_OID", "LONG", None),
-                    ("SHIFT", "DOUBLE", None),
-                    ("AZIMUTH", "DOUBLE", None),
-                    ("KIND", "TEXT", 20),
-                ])
+            # ---- Read the new cartographic/display mode + preview flag ----
+            mode = parameters[23].valueAsText or MODE_DISPLAY_ONLY
+            if mode not in DECONFLICT_MODES:
+                mode = MODE_DISPLAY_ONLY
+            create_preview = bool(parameters[24].value)
+            _msg(u"Deconflict Output Mode: {0}".format(mode))
+            if mode == MODE_LEGACY:
+                _warn(u"LEGACY_GEOMETRY_MOVE selected: output SHAPE@ will be physically "
+                      u"moved. This is legacy/destructive behaviour and is NOT recommended.")
+            else:
+                _msg(u"Main output geometry will be PRESERVED; display-only offsets are "
+                     u"written to CARTO_* fields (cartographic displacement is NOT real "
+                     u"coordinate editing).")
 
-            audit_rows = []
-            start_ts = time.time()
+            # ---- Shared context for the per-layer processors ----
+            ctx = _Ctx()
+            ctx.out_gdb = out_gdb
+            ctx.sr = sr
+            ctx.scratch_ws = scratch_ws
+            ctx.plat_prefix = PLAT_PREFIX
+            ctx.clearance = clearance
+            ctx.road_geom = road_geom
+            ctx.road_buffer_geom = road_buffer_geom
+            ctx.diss_fc = diss_fc
+            ctx.buf_fc = buf_fc
+            ctx.mode = mode
+            ctx.create_preview = create_preview
+            ctx.use_near = use_near
+            ctx.near_chunk_size = near_chunk_size
+            ctx.max_shift = max_shift
+            ctx.max_iter = max_iter
+            ctx.lock_field = lock_field
+            ctx.keep_near_fields = keep_near_fields
+            ctx.line_strategy = line_strategy
+            ctx.offset_side = offset_side
+            ctx.densify_step = densify_step
+            ctx.preserve_endpoints = preserve_endpoints
+            ctx.smooth_iters = smooth_iters
+            ctx.max_deflection_deg = max_deflection_deg
+            ctx.report_rows = []
+            ctx.audit_rows = []
 
-            def _audit(kind, layer, oid, moved, shift, az, note):
-                audit_rows.append({
-                    "kind": kind,
-                    "layer": _safe_unicode(layer),
-                    "oid": oid,
-                    "moved": int(1 if moved else 0),
-                    "shift": float(shift or 0.0),
-                    "azimuth": "" if az is None else float(az),
+            def _audit(kind, layer, oid, moved, shift, az, note,
+                       cb=0, ca=0, mode_val=mode, preview_name=u""):
+                ctx.audit_rows.append({
+                    "kind": kind, "layer": _safe_unicode(layer), "oid": oid,
+                    "moved": int(1 if moved else 0), "shift": float(shift or 0.0),
+                    "azimuth": u"" if az is None else float(az),
                     "note": _safe_unicode(note),
+                    "conflict_before": int(cb), "conflict_after_preview": int(ca),
+                    "mode": _safe_unicode(mode_val),
+                    "preview_fc": _safe_unicode(preview_name),
                 })
+            ctx.audit = _audit
 
+            # ---- Global QA feature classes + report table ----
+            _make_global_qa_fcs(ctx, create_errors, create_vectors)
+            _make_report_table(ctx)
+
+            start_ts = time.time()
             out_point_fcs = []
             out_line_fcs = []
             out_poly_fcs = []
 
             # =================================================================
-            # POINTS
+            # POINTS (display-deconfliction)
             # =================================================================
             if point_layers:
-                _msg(u"---- POINT layers ----")
+                _msg(u"---- POINT layers (display-deconfliction) ----")
             for lyr in point_layers:
-                tmp_lyr = None
                 try:
-                    src = _resolve_full_source(lyr)
-                    desc = arcpy.Describe(src)
-                    if desc.shapeType.upper() != "POINT":
-                        _warn(u"Skipping (not POINT): {}".format(lyr))
-                        continue
-                    base = os.path.basename(desc.catalogPath)
-                    out_name = _new_name(base, suffix, out_gdb)
-                    out_fc = os.path.join(out_gdb, out_name)
-                    _msg(u"Copy points -> {}".format(out_fc))
-                    _copy_or_project(src, out_fc, sr)
-                    _ensure_fields(out_fc, [
-                        ("_RDCL_MOV", "SHORT", None),
-                        ("_RDCL_SD", "DOUBLE", None),
-                        ("_RDCL_AZ", "DOUBLE", None),
-                        ("_RDCL_NOTE", "TEXT", 255),
-                    ])
-                    total = _get_count(out_fc)
-                    _diag(u"POINTS '{}': total={}".format(desc.name, total))
-
-                    tmp_lyr = "ptlyr_" + uuid.uuid4().hex[:6]
-                    _gp_try(arcpy.MakeFeatureLayer_management, [out_fc, tmp_lyr])
-                    _gp_try(arcpy.SelectLayerByLocation_management,
-                            [tmp_lyr, "INTERSECT", buf_fc])
-                    cand_count = _get_count(tmp_lyr)
-                    _diag(u"POINTS '{}': in clearance buffer={}".format(desc.name, cand_count))
-
-                    # ---- ONE NEAR pass for the in-buffer subset, NOT inside the loop.
-                    near_dict = {}
-                    if use_near and cand_count > 0:
-                        nd = _build_near_table_chunked(tmp_lyr, diss_fc, scratch_ws, near_chunk_size)
-                        if nd is None:
-                            _warn(u"GenerateNearTable failed for points; "
-                                  u"falling back to per-feature geometry queries.")
-                        else:
-                            near_dict = nd
-
-                    has_lock = bool(lock_field and arcpy.ListFields(out_fc, lock_field))
-                    fields = (["OID@", "SHAPE@"]
-                              + ([lock_field] if has_lock else [])
-                              + ["_RDCL_MOV", "_RDCL_SD", "_RDCL_AZ", "_RDCL_NOTE"])
-                    idx_shape = fields.index("SHAPE@")
-                    idx_mov = fields.index("_RDCL_MOV")
-                    idx_sd = fields.index("_RDCL_SD")
-                    idx_az = fields.index("_RDCL_AZ")
-                    idx_note = fields.index("_RDCL_NOTE")
-                    idx_lock = fields.index(lock_field) if has_lock else None
-
-                    moved_cnt = 0
-                    err_cnt = 0
-                    _prog_start(u"Deconfliction (points): {}".format(desc.name), cand_count)
-                    try:
-                        with arcpy.da.UpdateCursor(tmp_lyr, fields) as cur:
-                            for row in cur:
-                                _prog_tick()
-                                oid = row[0]
-                                geom = row[idx_shape]
-                                if geom is None:
-                                    if create_errors and err_pts_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_pts_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([None, _safe_unicode(desc.name), oid,
-                                                          "GEOM_NULL", "Null geometry"])
-                                    continue
-                                if has_lock:
-                                    try:
-                                        if row[idx_lock] == 0:
-                                            row[idx_mov] = 0
-                                            row[idx_sd] = 0.0
-                                            row[idx_az] = None
-                                            row[idx_note] = u"LOCKED (0)"
-                                            cur.updateRow(row)
-                                            _audit("POINT", desc.name, oid, False, 0.0, None, "LOCKED (0)")
-                                            continue
-                                    except (TypeError, ValueError):
-                                        pass
-                                old_geom = geom
-                                near_rec = near_dict.get(int(oid)) if near_dict else None
-                                if near_rec is not None:
-                                    ndist, nx, ny = near_rec
-                                    new_geom, moved, sh, az, note = _push_point_to_clearance_from_near(
-                                        geom, nx, ny, ndist, clearance,
-                                        road_geom=road_geom, max_shift=max_shift)
-                                else:
-                                    new_geom, moved, sh, az, note = _push_point_to_clearance(
-                                        geom, road_geom, clearance, max_shift=max_shift)
-                                still = False
-                                try:
-                                    still = (road_buffer_geom.contains(new_geom)
-                                             or (road_geom.distanceTo(new_geom) < clearance))
-                                except (arcpy.ExecuteError, RuntimeError, AttributeError):
-                                    pass
-                                row[idx_shape] = new_geom
-                                row[idx_mov] = 1 if moved else 0
-                                row[idx_sd] = float(sh)
-                                row[idx_az] = az if az is not None else None
-                                row[idx_note] = note + (u" | STILL_CONFLICT" if still else u"")
-                                cur.updateRow(row)
-                                if moved:
-                                    moved_cnt += 1
-                                    _audit("POINT", desc.name, oid, True, sh, az, note)
-                                    if vec_fc:
-                                        try:
-                                            arr = arcpy.Array([old_geom.firstPoint, new_geom.firstPoint])
-                                            vgeom = arcpy.Polyline(arr, sr)
-                                            with arcpy.da.InsertCursor(
-                                                    vec_fc,
-                                                    ["SHAPE@", "SRC_LAYER", "SRC_OID",
-                                                     "SHIFT", "AZIMUTH", "KIND"]) as ic:
-                                                ic.insertRow([vgeom, _safe_unicode(desc.name), oid,
-                                                              float(sh), float(az), "POINT"])
-                                        except (arcpy.ExecuteError, RuntimeError):
-                                            pass
-                                else:
-                                    _audit("POINT", desc.name, oid, False, 0.0, None, note)
-                                if still:
-                                    err_cnt += 1
-                                    if create_errors and err_pts_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_pts_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([old_geom, _safe_unicode(desc.name), oid,
-                                                          "STILL_CONFLICT", "Could not clear to distance"])
-                    finally:
-                        _prog_end()
-                    _safe_delete(tmp_lyr)
-                    tmp_lyr = None
-                    if not keep_near_fields:
-                        _delete_near_fields(out_fc)
-                    out_point_fcs.append(out_fc)
-                    _diag(u"POINTS '{}': moved_OK={}, still_conflict={}".format(
-                        desc.name, moved_cnt, err_cnt))
-                    near_dict = None
+                    out_fc = _process_target_layer(ctx, lyr, "POINT")
+                    if out_fc:
+                        out_point_fcs.append(out_fc)
                     gc.collect()
                 except (arcpy.ExecuteError, RuntimeError) as e:
+                    if u"DISPLAY_ONLY_GEOMETRY_CHANGED" in _safe_unicode(e):
+                        raise
                     _warn(u"Point layer failed: {} | {}".format(lyr, e))
                     _warn(traceback.format_exc())
-                finally:
-                    _safe_delete(tmp_lyr)
 
             # =================================================================
-            # LINES
+            # LINES (display-deconfliction)
             # =================================================================
             if line_layers:
-                _msg(u"---- LINE layers ----")
+                _msg(u"---- LINE layers (display-deconfliction) ----")
             for lyr in line_layers:
-                tmp_lyr = None
                 try:
-                    src = _resolve_full_source(lyr)
-                    desc = arcpy.Describe(src)
-                    if desc.shapeType.upper() != "POLYLINE":
-                        _warn(u"Skipping (not POLYLINE): {}".format(lyr))
-                        continue
-                    base = os.path.basename(desc.catalogPath)
-                    out_name = _new_name(base, suffix, out_gdb)
-                    out_fc = os.path.join(out_gdb, out_name)
-                    _msg(u"Copy lines -> {}".format(out_fc))
-                    _copy_or_project(src, out_fc, sr)
-                    _ensure_fields(out_fc, [
-                        ("_RDCL_MOV", "SHORT", None),
-                        ("_RDCL_SD", "DOUBLE", None),
-                        ("_RDCL_NOTE", "TEXT", 255),
-                    ])
-                    total = _get_count(out_fc)
-                    _diag(u"LINES '{}': total={}".format(desc.name, total))
-
-                    tmp_lyr = "lnlyr_" + uuid.uuid4().hex[:6]
-                    _gp_try(arcpy.MakeFeatureLayer_management, [out_fc, tmp_lyr])
-                    _gp_try(arcpy.SelectLayerByLocation_management,
-                            [tmp_lyr, "INTERSECT", buf_fc])
-                    cand_count = _get_count(tmp_lyr)
-                    _diag(u"LINES '{}': in clearance buffer={}".format(desc.name, cand_count))
-
-                    has_lock = bool(lock_field and arcpy.ListFields(out_fc, lock_field))
-                    fields = (["OID@", "SHAPE@"]
-                              + ([lock_field] if has_lock else [])
-                              + ["_RDCL_MOV", "_RDCL_SD", "_RDCL_NOTE"])
-                    idx_shape = fields.index("SHAPE@")
-                    idx_mov = fields.index("_RDCL_MOV")
-                    idx_sd = fields.index("_RDCL_SD")
-                    idx_note = fields.index("_RDCL_NOTE")
-                    idx_lock = fields.index(lock_field) if has_lock else None
-
-                    moved_cnt = 0
-                    err_cnt = 0
-                    _prog_start(u"Deconfliction (lines): {}".format(desc.name), cand_count)
-                    try:
-                        with arcpy.da.UpdateCursor(tmp_lyr, fields) as cur:
-                            for row in cur:
-                                _prog_tick()
-                                oid = row[0]
-                                geom = row[idx_shape]
-                                if geom is None:
-                                    if create_errors and err_lns_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_lns_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([None, _safe_unicode(desc.name), oid,
-                                                          "GEOM_NULL", "Null geometry"])
-                                    continue
-                                if has_lock:
-                                    try:
-                                        if row[idx_lock] == 0:
-                                            row[idx_mov] = 0
-                                            row[idx_sd] = 0.0
-                                            row[idx_note] = u"LOCKED (0)"
-                                            cur.updateRow(row)
-                                            _audit("LINE", desc.name, oid, False, 0.0, None, "LOCKED (0)")
-                                            continue
-                                    except (TypeError, ValueError):
-                                        pass
-                                old_geom = geom
-                                moved = False
-                                still = False
-                                note = u""
-                                sd_val = 0.0
-                                new_geom = geom
-                                if line_strategy == "WHOLE_OFFSET":
-                                    off_dist = clearance
-                                    if max_shift is not None and max_shift > 0 and max_shift < clearance:
-                                        off_dist = float(max_shift)
-                                    new_geom, moved, note = _whole_offset_best_side(
-                                        geom, road_buffer_geom, off_dist, force_side=offset_side)
-                                    if not moved:
-                                        new_geom, moved, max_v_shift, note2, still = _local_push_polyline(
-                                            geom, road_geom, road_buffer_geom, clearance,
-                                            densify_step=densify_step,
-                                            preserve_endpoints=preserve_endpoints,
-                                            smooth_iters=smooth_iters,
-                                            max_shift=max_shift,
-                                            max_iter=max_iter,
-                                            max_deflection_deg=max_deflection_deg)
-                                        note = note + u" | Fallback->LocalPush: " + note2
-                                        sd_val = float(max_v_shift) if moved else 0.0
-                                    else:
-                                        try:
-                                            still = (not road_buffer_geom.disjoint(new_geom))
-                                        except (arcpy.ExecuteError, RuntimeError, AttributeError):
-                                            still = False
-                                        sd_val = float(off_dist) if moved else 0.0
-                                else:
-                                    new_geom, moved, max_v_shift, note, still = _local_push_polyline(
-                                        geom, road_geom, road_buffer_geom, clearance,
-                                        densify_step=densify_step,
-                                        preserve_endpoints=preserve_endpoints,
-                                        smooth_iters=smooth_iters,
-                                        max_shift=max_shift,
-                                        max_iter=max_iter,
-                                        max_deflection_deg=max_deflection_deg)
-                                    sd_val = float(max_v_shift) if moved else 0.0
-                                row[idx_shape] = new_geom
-                                row[idx_mov] = 1 if moved else 0
-                                row[idx_sd] = sd_val
-                                row[idx_note] = _safe_unicode(note) + (u" | STILL_CONFLICT" if still else u"")
-                                cur.updateRow(row)
-                                if moved:
-                                    moved_cnt += 1
-                                    _audit("LINE", desc.name, oid, True, sd_val, None, note)
-                                    if vec_fc:
-                                        try:
-                                            p0 = old_geom.positionAlongLine(0.5, True).firstPoint
-                                            p1 = new_geom.positionAlongLine(0.5, True).firstPoint
-                                            dx = p1.X - p0.X
-                                            dy = p1.Y - p0.Y
-                                            sh = math.sqrt(dx * dx + dy * dy)
-                                            az = _azimuth_deg(dx, dy)
-                                            arr = arcpy.Array([p0, p1])
-                                            vgeom = arcpy.Polyline(arr, sr)
-                                            with arcpy.da.InsertCursor(
-                                                    vec_fc,
-                                                    ["SHAPE@", "SRC_LAYER", "SRC_OID",
-                                                     "SHIFT", "AZIMUTH", "KIND"]) as ic:
-                                                ic.insertRow([vgeom, _safe_unicode(desc.name), oid,
-                                                              float(sh), float(az), "LINE"])
-                                        except (arcpy.ExecuteError, RuntimeError, AttributeError):
-                                            pass
-                                else:
-                                    _audit("LINE", desc.name, oid, False, 0.0, None, note)
-                                if still:
-                                    err_cnt += 1
-                                    if create_errors and err_lns_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_lns_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([old_geom, _safe_unicode(desc.name), oid,
-                                                          "STILL_CONFLICT", "Could not clear to distance"])
-                    finally:
-                        _prog_end()
-                    _safe_delete(tmp_lyr)
-                    tmp_lyr = None
-                    out_line_fcs.append(out_fc)
-                    _diag(u"LINES '{}': moved_OK={}, still_conflict={}".format(
-                        desc.name, moved_cnt, err_cnt))
+                    out_fc = _process_target_layer(ctx, lyr, "LINE")
+                    if out_fc:
+                        out_line_fcs.append(out_fc)
                     gc.collect()
                 except (arcpy.ExecuteError, RuntimeError) as e:
+                    if u"DISPLAY_ONLY_GEOMETRY_CHANGED" in _safe_unicode(e):
+                        raise
                     _warn(u"Line layer failed: {} | {}".format(lyr, e))
                     _warn(traceback.format_exc())
-                finally:
-                    _safe_delete(tmp_lyr)
 
             # =================================================================
-            # POLYGONS
+            # POLYGONS (display-deconfliction)
             # =================================================================
             if poly_layers:
-                _msg(u"---- POLYGON layers ----")
+                _msg(u"---- POLYGON layers (display-deconfliction) ----")
             for lyr in poly_layers:
-                tmp_lyr = None
                 try:
-                    src = _resolve_full_source(lyr)
-                    desc = arcpy.Describe(src)
-                    if desc.shapeType.upper() != "POLYGON":
-                        _warn(u"Skipping (not POLYGON): {}".format(lyr))
-                        continue
-                    base = os.path.basename(desc.catalogPath)
-                    out_name = _new_name(base, suffix, out_gdb)
-                    out_fc = os.path.join(out_gdb, out_name)
-                    _msg(u"Copy polygons -> {}".format(out_fc))
-                    _copy_or_project(src, out_fc, sr)
-                    _ensure_fields(out_fc, [
-                        ("_RDCL_MOV", "SHORT", None),
-                        ("_RDCL_SD", "DOUBLE", None),
-                        ("_RDCL_NOTE", "TEXT", 255),
-                    ])
-                    total = _get_count(out_fc)
-                    _diag(u"POLYGONS '{}': total={}".format(desc.name, total))
-
-                    tmp_lyr = "polylr_" + uuid.uuid4().hex[:6]
-                    _gp_try(arcpy.MakeFeatureLayer_management, [out_fc, tmp_lyr])
-                    _gp_try(arcpy.SelectLayerByLocation_management,
-                            [tmp_lyr, "INTERSECT", buf_fc])
-                    cand_count = _get_count(tmp_lyr)
-                    _diag(u"POLYGONS '{}': in clearance buffer={}".format(desc.name, cand_count))
-
-                    # ---- ONE NEAR pass for the in-buffer subset, NOT inside the loop.
-                    # NEAR_X / NEAR_Y are the footpoint on the (dissolved) road; the
-                    # polygon's centroid -> footpoint vector is our default push
-                    # direction. _best_polygon_translation refines further if needed.
-                    near_dict = {}
-                    if use_near and cand_count > 0:
-                        nd = _build_near_table_chunked(tmp_lyr, diss_fc, scratch_ws, near_chunk_size)
-                        if nd is None:
-                            _warn(u"GenerateNearTable failed for polygons; "
-                                  u"falling back to per-feature distanceTo (slower).")
-                        else:
-                            near_dict = nd
-
-                    has_lock = bool(lock_field and arcpy.ListFields(out_fc, lock_field))
-                    fields = (["OID@", "SHAPE@"]
-                              + ([lock_field] if has_lock else [])
-                              + ["_RDCL_MOV", "_RDCL_SD", "_RDCL_NOTE"])
-                    idx_shape = fields.index("SHAPE@")
-                    idx_mov = fields.index("_RDCL_MOV")
-                    idx_sd = fields.index("_RDCL_SD")
-                    idx_note = fields.index("_RDCL_NOTE")
-                    idx_lock = fields.index(lock_field) if has_lock else None
-
-                    moved_cnt = 0
-                    err_cnt = 0
-                    _prog_start(u"Deconfliction (polygons): {}".format(desc.name), cand_count)
-                    try:
-                        with arcpy.da.UpdateCursor(tmp_lyr, fields) as cur:
-                            for row in cur:
-                                _prog_tick()
-                                oid = row[0]
-                                geom = row[idx_shape]
-                                if geom is None:
-                                    if create_errors and err_pol_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_pol_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([None, _safe_unicode(desc.name), oid,
-                                                          "GEOM_NULL", "Null geometry"])
-                                    continue
-                                if has_lock:
-                                    try:
-                                        if row[idx_lock] == 0:
-                                            row[idx_mov] = 0
-                                            row[idx_sd] = 0.0
-                                            row[idx_note] = u"LOCKED (0)"
-                                            cur.updateRow(row)
-                                            _audit("POLYGON", desc.name, oid, False, 0.0, None, "LOCKED (0)")
-                                            continue
-                                    except (TypeError, ValueError):
-                                        pass
-                                old_geom = geom
-
-                                # ---- Distance / footpoint from the precomputed NEAR-table.
-                                near_rec = near_dict.get(int(oid)) if near_dict else None
-                                dist0 = None
-                                nx = None
-                                ny = None
-                                if near_rec is not None:
-                                    ndist, nnx, nny = near_rec
-                                    if ndist is not None:
-                                        dist0 = float(ndist)
-                                    nx = nnx
-                                    ny = nny
-                                # Fallback: per-feature distanceTo only if NEAR-table
-                                # data is unavailable (legacy path).
-                                if dist0 is None:
-                                    try:
-                                        dist0 = road_geom.distanceTo(geom)
-                                    except (arcpy.ExecuteError, RuntimeError, AttributeError):
-                                        dist0 = 0.0
-                                if dist0 >= clearance:
-                                    row[idx_mov] = 0
-                                    row[idx_sd] = 0.0
-                                    row[idx_note] = u"OK (no move)"
-                                    cur.updateRow(row)
-                                    _audit("POLYGON", desc.name, oid, False, 0.0, None, "OK (no move)")
-                                    continue
-
-                                # Push direction: centroid -> footpoint vector.
-                                cent = geom.centroid
-                                cx = cent.firstPoint.X
-                                cy = cent.firstPoint.Y
-                                dist_along = None
-                                side = None
-                                if nx is None or ny is None:
-                                    # Fallback: one queryPointAndDistance for direction.
-                                    p_on, dist_along, _df, side = _nearest_point_and_side(road_geom, cent)
-                                    try:
-                                        nx = p_on.firstPoint.X
-                                        ny = p_on.firstPoint.Y
-                                    except (AttributeError, RuntimeError):
-                                        nx = None
-                                        ny = None
-                                vx = (cx - nx) if nx is not None else 0.0
-                                vy = (cy - ny) if ny is not None else 0.0
-                                vd = math.sqrt(vx * vx + vy * vy)
-                                if vd < 1e-9:
-                                    if dist_along is None:
-                                        # Recover dist_along/side once for tangent fallback.
-                                        _po, dist_along, _df, side = _nearest_point_and_side(road_geom, cent)
-                                    tx, ty = _tangent_at_distance(road_geom, dist_along)
-                                    ux, uy = _unit_normal_from_tangent(tx, ty, side or "LEFT")
-                                else:
-                                    ux, uy = (vx / vd, vy / vd)
-
-                                new_geom, total_shift, still, note = _best_polygon_translation(
-                                    geom, road_geom, clearance, ux, uy, dist0,
-                                    dist_along=dist_along, max_shift=max_shift,
-                                    max_iter=max_iter, side=side)
-                                note = _safe_unicode(note)
-                                try:
-                                    if (max_shift is not None and max_shift > 0
-                                            and total_shift >= (float(max_shift) - 1e-9)):
-                                        note = note + u" | CAPPED by MaxShift"
-                                except (TypeError, ValueError):
-                                    pass
-                                row[idx_shape] = new_geom
-                                row[idx_mov] = 1
-                                row[idx_sd] = float(total_shift)
-                                row[idx_note] = note + (u" | STILL_CONFLICT" if still else u"")
-                                cur.updateRow(row)
-                                moved_cnt += 1
-                                _audit("POLYGON", desc.name, oid, True, total_shift, None, note)
-                                if vec_fc:
-                                    try:
-                                        p0 = old_geom.centroid.firstPoint
-                                        p1 = new_geom.centroid.firstPoint
-                                        dx = p1.X - p0.X
-                                        dy = p1.Y - p0.Y
-                                        sh = math.sqrt(dx * dx + dy * dy)
-                                        az = _azimuth_deg(dx, dy)
-                                        arr = arcpy.Array([p0, p1])
-                                        vgeom = arcpy.Polyline(arr, sr)
-                                        with arcpy.da.InsertCursor(
-                                                vec_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID",
-                                                 "SHIFT", "AZIMUTH", "KIND"]) as ic:
-                                            ic.insertRow([vgeom, _safe_unicode(desc.name), oid,
-                                                          float(sh), float(az), "POLYGON"])
-                                    except (arcpy.ExecuteError, RuntimeError, AttributeError):
-                                        pass
-                                if still:
-                                    err_cnt += 1
-                                    if create_errors and err_pol_fc:
-                                        with arcpy.da.InsertCursor(
-                                                err_pol_fc,
-                                                ["SHAPE@", "SRC_LAYER", "SRC_OID", "ERR_CODE", "DETAIL"]) as ic:
-                                            ic.insertRow([old_geom, _safe_unicode(desc.name), oid,
-                                                          "STILL_CONFLICT", "Could not clear to distance"])
-                    finally:
-                        _prog_end()
-                    _safe_delete(tmp_lyr)
-                    tmp_lyr = None
-                    if not keep_near_fields:
-                        _delete_near_fields(out_fc)
-                    out_poly_fcs.append(out_fc)
-                    _diag(u"POLYGONS '{}': moved_OK={}, still_conflict={}".format(
-                        desc.name, moved_cnt, err_cnt))
-                    near_dict = None
+                    out_fc = _process_target_layer(ctx, lyr, "POLYGON")
+                    if out_fc:
+                        out_poly_fcs.append(out_fc)
                     gc.collect()
                 except (arcpy.ExecuteError, RuntimeError) as e:
+                    if u"DISPLAY_ONLY_GEOMETRY_CHANGED" in _safe_unicode(e):
+                        raise
                     _warn(u"Polygon layer failed: {} | {}".format(lyr, e))
                     _warn(traceback.format_exc())
-                finally:
-                    _safe_delete(tmp_lyr)
 
             # =================================================================
-            # CSV report
+            # Report table (geodatabase) - per-layer summary
+            # =================================================================
+            try:
+                with arcpy.da.InsertCursor(ctx.report_fc, [
+                        "LAYER", "KIND", "MODE", "N_TOTAL", "N_CONFLICT_BEFORE",
+                        "N_CARTO_MOVED", "N_CONFLICT_AFTER_PREVIEW",
+                        "REAL_GEOMETRY_STATUS", "PREVIEW_FC"]) as ic:
+                    for r in ctx.report_rows:
+                        ic.insertRow([r["layer"], r["kind"], r["mode"], r["total"],
+                                      r["cb"], r["moved"], r["ca"],
+                                      r["real_status"], r["preview_fc"]])
+                _msg(u"Report table: {}".format(ctx.report_fc))
+            except (arcpy.ExecuteError, RuntimeError):
+                _warn(u"Failed to write report table.")
+                _warn(traceback.format_exc())
+
+            # =================================================================
+            # CSV report (separates REAL-geometry status from CARTO/preview)
             # =================================================================
             if write_csv:
                 try:
                     out_folder = os.path.dirname(out_gdb)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    csv_path = os.path.join(out_folder, "RDCL_Report_{}.csv".format(ts))
+                    csv_path = os.path.join(out_folder, "{0}_Report_{1}.csv".format(PLAT_PREFIX, ts))
                     with open(csv_path, "wb") as f:
                         writer = csv.writer(f)
-                        writer.writerow(["kind", "layer", "oid", "moved", "shift", "azimuth", "note"])
-                        for r in audit_rows:
+                        writer.writerow([
+                            "kind", "layer", "oid", "mode",
+                            "real_geometry_status",
+                            "carto_moved", "carto_shift", "carto_azimuth",
+                            "conflict_before", "conflict_after_preview",
+                            "preview_fc", "note"])
+                        real_status = (u"MOVED_LEGACY" if mode == MODE_LEGACY else u"UNCHANGED")
+                        for r in ctx.audit_rows:
                             writer.writerow([
                                 _to_utf8(r.get("kind", "")),
                                 _to_utf8(r.get("layer", "")),
                                 r.get("oid", ""),
+                                _to_utf8(r.get("mode", "")),
+                                _to_utf8(real_status),
                                 r.get("moved", ""),
                                 r.get("shift", ""),
                                 r.get("azimuth", ""),
+                                r.get("conflict_before", ""),
+                                r.get("conflict_after_preview", ""),
+                                _to_utf8(r.get("preview_fc", "")),
                                 _to_utf8(r.get("note", "")),
                             ])
                     _msg(u"CSV report: {}".format(csv_path))
@@ -2418,13 +2723,20 @@ class RoadDeconflictTool(object):
 
             elapsed = time.time() - start_ts
             _msg(u"==== SUMMARY ====")
-            _msg(u"Points outputs: {}".format(len(out_point_fcs)))
-            _msg(u"Lines outputs : {}".format(len(out_line_fcs)))
-            _msg(u"Polys outputs : {}".format(len(out_poly_fcs)))
-            if create_errors:
-                _msg(u"Error FCs: {}, {}, {}".format(err_pts_fc, err_lns_fc, err_pol_fc))
-            if vec_fc:
-                _msg(u"Vectors FC: {}".format(vec_fc))
+            _msg(u"Mode: {}".format(mode))
+            _msg(u"Point   CartoOffsets outputs: {}".format(len(out_point_fcs)))
+            _msg(u"Line    CartoOffsets outputs: {}".format(len(out_line_fcs)))
+            _msg(u"Polygon CartoOffsets outputs: {}".format(len(out_poly_fcs)))
+            if mode != MODE_LEGACY:
+                _msg(u"Main output geometry preserved (DISPLAY_ONLY_GEOMETRY self-check passed).")
+            if ctx.conf_before_fc:
+                _msg(u"Conflicts_Before: {}".format(ctx.conf_before_fc))
+            if ctx.conf_after_fc:
+                _msg(u"Conflicts_AfterPreview: {}".format(ctx.conf_after_fc))
+            if ctx.err_fc:
+                _msg(u"Errors_QA: {}".format(ctx.err_fc))
+            if ctx.vec_fc:
+                _msg(u"DisplacementVectors_QA: {}".format(ctx.vec_fc))
             _msg(u"Elapsed: {:.1f}s".format(elapsed))
             _msg(u"Done.")
 
